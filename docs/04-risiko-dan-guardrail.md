@@ -122,12 +122,14 @@ kode yang sudah tidak ada.
 **Alasan circuit breaker trip** (`evaluate_breaker()`, disimpan di `bot_state.halt_reason`)
 
 `HALTED` (sudah di-halt manual — tetap halt setelah restart, tidak menyala sendiri),
-`DAILY_LOSS`, `DRAWDOWN`, `CONSEC_LOSSES`, `DAY_START_EQUITY_INVALID`.
+`DAILY_LOSS`, `DRAWDOWN`, `CONSEC_LOSSES`, `DAY_START_EQUITY_INVALID`,
+`EQUITY_READ_FAILED` (saldo tidak terbaca dari bursa — preflight tidak berani melanjutkan
+tanpa angka ekuitas, karena semua batas berbasis persentase ekuitas).
 
 **Alasan exit** (monitor 15 detik)
 
 `STOP_LOSS`, `TAKE_PROFIT`, `TIME_STOP`, `ANOMALY:LEVERAGE_<n>`,
-`ANOMALY:NOT_ISOLATED`, `ANOMALY:SYMBOL_NOT_WHITELISTED`, `NOT_ISOLATED`, `SYMBOL_NOT_WHITELISTED`, `LEVERAGE_<n>` — kode ini dirangkai dengan angka leverage yang terbaca dari bursa, misalnya LEVERAGE_20 — beberapa anomali digabung dengan koma dalam satu kode.
+`ANOMALY:NOT_ISOLATED`, `ANOMALY:SYMBOL_NOT_WHITELISTED`, `NOT_ISOLATED`, `SYMBOL_NOT_WHITELISTED`, `STOP_UNKNOWN` (posisi tanpa catatan stop — diratakan, bukan dikarang pengamannya), `LEVERAGE_<n>` — kode ini dirangkai dengan angka leverage yang terbaca dari bursa, misalnya LEVERAGE_20 — beberapa anomali digabung dengan koma dalam satu kode.
 
 **Masalah preflight** (setelan akun tidak cocok → HALT)
 

@@ -2,7 +2,7 @@ PY ?= python3
 
 .PHONY: test test-py test-js workflows validate vectors simulate clean
 
-test: test-py test-js validate contract   ## jalankan seluruh pemeriksaan
+test: test-py test-js validate contract deploy   ## jalankan seluruh pemeriksaan
 
 test-py:                         ## unit test kernel risiko (Python)
 	$(PY) -m pytest -q
@@ -19,6 +19,9 @@ validate:                        ## validasi struktur workflow n8n
 
 contract:                        ## validasi kontrak runner<->adapter<->skema<->dokumen
 	$(PY) tools/validate_mirofish_contract.py
+
+deploy:                          ## validasi berkas deployment (compose, Dockerfile, .env)
+	$(PY) tools/validate_deploy.py
 
 vectors:                         ## regenerasi vektor paritas Python<->JS
 	$(PY) tools/make_parity_vectors.py

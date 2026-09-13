@@ -1,0 +1,6 @@
+# Dependensi untuk menjalankan seluruh pemeriksaan (make test / CI).
+# Kernel risiko sendiri (risk_engine/) tidak butuh dependensi apa pun.
+pytest==9.*
+pyyaml==6.*          # tools/validate_deploy.py mem-parsing docker-compose.yml
+fastapi==0.115.*     # mirofish_runner/app.py
+httpx==0.27.*        # fastapi.testclient

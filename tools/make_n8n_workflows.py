@@ -87,26 +87,66 @@ return out;
 
 ENTRY_MONITOR = """
 // ---- entry point n8n: trailing stop + keputusan exit --------------------------------
-const out = [];
+// Dua input: posisi dari bursa (satu respons berisi banyak posisi) dan baris
+// open_position dari DB. Keduanya digabung di sini berdasarkan bentuknya, dan
+// setiap posisi diproses sendiri-sendiri.
+const DEFAULT_CFG = { leverage: 50, max_hold_hours: 24 };
+
+const merged = { positions: [], stateByPos: {}, cfg: DEFAULT_CFG, atr: 0, whitelist: [] };
 for (const item of items) {
-  const j = item.json;
-  const pos = j.position;              // dari GET /uapi/v1/account/positions
+  const j = item.json || {};
+  if (j.__node) continue;
+
+  if (j.position) {                       // mode siap-pakai: satu record per posisi
+    merged.positions.push({ position: j.position, state: j.state || {},
+                            atr: Number(j.atr || 0), cfg: j.cfg || merged.cfg,
+                            whitelist: j.whitelist || merged.whitelist });
+    continue;
+  }
+  const arr = j?.data?.positions;
+  if (Array.isArray(arr)) {               // respons GET /uapi/v1/account/positions
+    for (const p of arr) merged.positions.push({ position: p });
+    continue;
+  }
+  if (j.position_id !== undefined) {      // baris open_position dari DB
+    merged.stateByPos[j.position_id] = j.state || {};
+    continue;
+  }
+  if (j.payload !== undefined) {          // snapshot pasar (atr, whitelist)
+    merged.atr = Number(j.payload.atr_1m || 0);
+    if (Array.isArray(j.payload.whitelist)) merged.whitelist = j.payload.whitelist;
+    continue;
+  }
+  if (j.cfg) merged.cfg = j.cfg;
+  if (Array.isArray(j.whitelist)) merged.whitelist = j.whitelist;
+}
+if (!merged.whitelist.length && $env.PIONEX_SYMBOL) merged.whitelist = [$env.PIONEX_SYMBOL];
+
+const out = [];
+for (const rec of merged.positions) {
+  const pos = rec.position;
   const mark = Number(pos.markPrice);
-  const atr = Number(j.atr || 0);
-  const side = pos.netSize >= 0 ? 'LONG' : 'SHORT';
-  const state = j.state || {};         // { stop, tp, highest, lowest, opened_at }
+  const atr = Number(rec.atr || merged.atr || 0);
+  const cfg = rec.cfg || merged.cfg;
+  const whitelist = rec.whitelist && rec.whitelist.length ? rec.whitelist : merged.whitelist;
+  const side = Number(pos.netSize) >= 0 ? 'LONG' : 'SHORT';
+  const state = rec.state && Object.keys(rec.state).length
+    ? rec.state : (merged.stateByPos[pos.positionId] || {});
 
   let stop = Number(state.stop);
-  if (atr > 0) {
+  // Trailing hanya boleh MENGGERAKKAN stop yang sudah ada. Bila state posisi tidak
+  // ditemukan, menghitung stop baru berarti mengarang pengaman yang tidak pernah
+  // ditetapkan gerbang risiko -- posisi seperti itu harus diratakan, bukan dijaga.
+  if (atr > 0 && Number.isFinite(stop)) {
     if (side === 'LONG') {
       const highest = Math.max(Number(state.highest || mark), mark);
       const candidate = highest - atr * 2;
-      if (candidate > stop) stop = candidate;
+      if (Number.isNaN(stop) || candidate > stop) stop = candidate;
       state.highest = highest;
     } else {
       const lowest = Number(state.lowest) > 0 ? Math.min(Number(state.lowest), mark) : mark;
       const candidate = lowest + atr * 2;
-      if (candidate > 0 && candidate < stop) stop = candidate;
+      if (candidate > 0 && (Number.isNaN(stop) || candidate < stop)) stop = candidate;
       state.lowest = lowest;
     }
   }
@@ -120,16 +160,20 @@ for (const item of items) {
     if (mark >= stop) reason = 'STOP_LOSS';
     else if (mark <= Number(state.tp)) reason = 'TAKE_PROFIT';
   }
-  if (reason === 'HOLD' && heldH >= Number(j.cfg.max_hold_hours)) reason = 'TIME_STOP';
+  if (reason === 'HOLD' && heldH >= Number(cfg.max_hold_hours)) reason = 'TIME_STOP';
 
-  // anomali = flatten
+  // Anomali = ratakan, bukan peringatkan. Setelan yang tidak cocok berarti posisi ini
+  // tidak berada di bawah asumsi risiko yang dihitung gerbang.
   const anomalies = [];
-  if (Number(pos.leverage) !== Number(j.cfg.leverage)) anomalies.push(`LEVERAGE_${pos.leverage}`);
+  if (Number(pos.leverage) !== Number(cfg.leverage)) anomalies.push(`LEVERAGE_${pos.leverage}`);
   if (!String(pos.isolatedMode || '').startsWith('ISOLATED')) anomalies.push('NOT_ISOLATED');
-  if (j.whitelist && !j.whitelist.includes(pos.symbol)) anomalies.push('SYMBOL_NOT_WHITELISTED');
+  if (whitelist.length && !whitelist.includes(pos.symbol)) anomalies.push('SYMBOL_NOT_WHITELISTED');
+  if (Number.isNaN(stop)) anomalies.push('STOP_UNKNOWN');
   if (anomalies.length) reason = 'ANOMALY:' + anomalies.join(',');
 
-  out.push({ json: { ...j, side, mark, stop, reason, exit: reason !== 'HOLD', state } });
+  out.push({ json: { ...rec, position: pos, cfg, atr, whitelist, state,
+                     side, mark, stop: Number.isFinite(stop) ? stop : 0,
+                     reason, exit: reason !== 'HOLD' } });
 }
 return out;
 """
@@ -177,30 +221,78 @@ return out;
 """
 
 ENTRY_BREAKER = """
-// ---- entry point n8n: circuit breaker ------------------------------------------------
+// ---- entry point n8n: gabung cabang + circuit breaker -----------------------------
+// Node ini punya TIGA input: baris bot_state, empat respons akun, dan risk table.
+// Cara n8n menggabungkan beberapa cabang menjadi satu item tidak diasumsikan di sini:
+// setiap cabang dikenali dari bentuk datanya, lalu digabung sendiri. Alasannya
+// praktis -- bila asumsi penggabungan salah, node ini akan membaca equity 0 dan
+// berhenti dengan DAY_START_EQUITY_INVALID, yaitu kegagalan yang terlihat seperti
+// "data belum ada" padahal penyebabnya struktural.
 const out = [];
-for (const item of items) {
-  const j = item.json;
-  const cfg = j.cfg;
-  const dayStart = Number(j.day_start_equity || 0);
-  const equity = Number(j.equity || 0);
-  const peak = Number(j.peak_equity || equity);
-  const consec = Number(j.consecutive_losses || 0);
+let merged = {};
 
-  if (!(dayStart > 0)) {
-    out.push({ json: { ...j, tripped: true, reason: 'DAY_START_EQUITY_INVALID' } });
-    continue;
+function pickEquity(json) {
+  if (Number.isFinite(Number(json.equity)) && Number(json.equity) > 0) return Number(json.equity);
+  const arr = json?.data?.balances || json?.balances;
+  if (!Array.isArray(arr)) return 0;
+  let total = 0;
+  for (const b of arr) {
+    const type = String(b.type || '').toUpperCase();
+    if (type && type !== 'PERP' && type !== 'FUTURES') continue;
+    total += Number(b.availableBalance ?? b.balance ?? b.equity ?? 0);
   }
+  return total;
+}
+
+let equity = 0;
+for (const item of items) {
+  const j = item.json || {};
+  if (j.__node) continue;                      // metadata internal n8n
+
+  if (j.req) {                                 // respons akun bertanda tangan
+    merged[j.req] = j.data !== undefined ? j.data : j;
+    if (j.req === 'balances') equity = pickEquity(merged.balances);
+  } else if (j.day_start_equity !== undefined || j.cfg !== undefined || j.halted !== undefined) {
+    // Baris bot_state.
+    Object.assign(merged, j);
+    // Ekuitas dibaca SETELAH Object.assign: baris bot_state tidak punya kolom equity,
+    // jadi item yang membawa equity sekaligus cfg (bentuk masukan langsung) tetap
+    // utuh, dan saldo dari cabang 'balances' tidak tertimpa.
+    if (Number.isFinite(Number(j.equity)) && Number(j.equity) > 0) equity = Number(j.equity);
+  } else if (j.data && (j.data.length !== undefined || j.data.rows)) {
+    merged.risk_table = (j.data.rows || j.data)[0] || {};
+  } else if (j.maxLeverage || j.maintMarginRatio) {
+    merged.risk_table = j;
+  }
+  // cabang lain (heartbeat, dsb.) sengaja tidak ikut: bot_state adalah sumbernya.
+}
+
+const cfg = merged.cfg || {};
+merged.equity = equity;
+const dayStart = Number(merged.day_start_equity || 0);
+const peak = Number(merged.peak_equity || equity);
+const consec = Number(merged.consecutive_losses || 0);
+
+if (!(dayStart > 0)) {
+  out.push({ json: { ...merged, tripped: true, reason: 'DAY_START_EQUITY_INVALID' } });
+} else if (!(equity > 0)) {
+  out.push({ json: { ...merged, tripped: true, reason: 'EQUITY_READ_FAILED' } });
+} else {
   const dayPnl = ((equity - dayStart) / dayStart) * 100;
   const dd = peak > 0 ? ((peak - equity) / peak) * 100 : 0;
 
   let tripped = false, reason = '';
-  if (j.halted === true || j.halted === 't') { tripped = true; reason = `HALTED ${j.halt_reason || 'UNKNOWN'}`; }
-  else if (dayPnl <= -cfg.max_daily_loss_pct) { tripped = true; reason = `DAILY_LOSS ${dayPnl.toFixed(2)}%`; }
-  else if (dd >= cfg.max_drawdown_pct) { tripped = true; reason = `DRAWDOWN ${dd.toFixed(2)}%`; }
-  else if (consec >= cfg.max_consecutive_losses) { tripped = true; reason = `CONSEC_LOSSES ${consec}`; }
+  if (merged.halted === true || merged.halted === 't') {
+    tripped = true; reason = `HALTED ${merged.halt_reason || 'UNKNOWN'}`;
+  } else if (dayPnl <= -cfg.max_daily_loss_pct) {
+    tripped = true; reason = `DAILY_LOSS ${dayPnl.toFixed(2)}%`;
+  } else if (dd >= cfg.max_drawdown_pct) {
+    tripped = true; reason = `DRAWDOWN ${dd.toFixed(2)}%`;
+  } else if (consec >= cfg.max_consecutive_losses) {
+    tripped = true; reason = `CONSEC_LOSSES ${consec}`;
+  }
 
-  out.push({ json: { ...j, tripped, reason, day_pnl_pct: dayPnl, drawdown_pct: dd,
+  out.push({ json: { ...merged, tripped, reason, day_pnl_pct: dayPnl, drawdown_pct: dd,
                      cooldown_until: tripped ? Date.now() + cfg.cooldown_minutes_after_trip * 60000 : null } });
 }
 return out;
@@ -579,22 +671,38 @@ def build_trading() -> dict:
                    "SELECT payload FROM market_snapshot ORDER BY ts DESC LIMIT 1;", (-700, 220)))
 
     f.add(code("Bangun sinyal", """
-// Sinyal teknikal SEDERHANA dan sengaja transparan: breakout EMA + filter volatilitas.
-// Ganti dengan strategi yang sudah Anda backtest; yang tidak boleh diubah adalah
-// bentuk keluarannya, karena gerbang risiko memvalidasi bentuk itu.
-const cfg = $json.cfg;
-const snap = $json.snapshot || {};
-const klines = snap.klines || [];
-const closes = klines.map(k => Number(k.close));
+// ---- entry point n8n: gabung 4 cabang lalu bangun sinyal ---------------------------
+// Input datang dari empat node Postgres terpisah. Penggabungan dilakukan di sini,
+// berdasarkan bentuk data tiap cabang, bukan mengandalkan cara n8n menggabungkannya.
+const byKey = {};
+for (const item of items) {
+  const j = item.json || {};
+  if (j.cfg !== undefined || j.day_start_equity !== undefined) byKey.state = j;
+  else if (j.verdict_ts !== undefined || j.schema_ok !== undefined) byKey.verdict = j;
+  else if (j.n !== undefined) byKey.count = j;
+  else if (j.payload !== undefined) byKey.snapshot = j;
+}
+
+const state = byKey.state || {};
+const cfg = state.cfg || {};
+const snap = byKey.snapshot?.payload || {};
+const verdict = byKey.verdict || null;
+const openPositions = Number(byKey.count?.n || 0);
+
+// Sinyal teknikal SEDERHANA dan sengaja transparan: EMA 9/21 + filter ATR.
+// Ganti dengan strategi yang sudah Anda backtest sendiri; yang tidak boleh diubah
+// adalah BENTUK keluarannya, karena gerbang risiko memvalidasi bentuk itu.
+const klines = Array.isArray(snap.klines) ? snap.klines : [];
+const closes = klines.map((k) => Number(k.close));
 const ema = (arr, n) => {
   if (arr.length < n) return null;
   const k = 2 / (n + 1);
-  let e = arr.slice(0, n).reduce((a, b) => a + b, 0) / n;
+  let e = arr.slice(0, n).reduce((a, b) => a + Number(b), 0) / n;
   for (let i = n; i < arr.length; i++) e = arr[i] * k + e * (1 - k);
   return e;
 };
 const fast = ema(closes, 9), slow = ema(closes, 21);
-const price = closes.length ? closes[closes.length - 1] : 0;
+const price = closes.length ? Number(closes[closes.length - 1]) : 0;
 const atr = Number(snap.atr_1m || 0);
 
 let direction = 'NONE';
@@ -604,32 +712,43 @@ if (fast && slow && price) {
 }
 
 // Jarak stop dibatasi plafon likuidasi; RR mengikuti min_rr_ratio config.
-const room = 1 / cfg.leverage - 0.005 - 0.0005;
+const room = 1 / Number(cfg.leverage || 50) - 0.005 - 0.0005;
 const dLiq = (room + 0.0005) / 1.0005;
-const maxStop = dLiq * (1 - cfg.liq_buffer_pct / 100);
-const stopDist = Math.min(Math.max(atr / price * 1.5, 0.002), maxStop * 0.9);
-const tpDist = stopDist * cfg.min_rr_ratio;
+const maxStop = dLiq * (1 - Number(cfg.liq_buffer_pct || 33) / 100);
+const stopDist = Math.min(Math.max((atr / (price || 1)) * 1.5, 0.002), maxStop * 0.9);
+const tpDist = stopDist * Number(cfg.min_rr_ratio || 1.1);
 
 const stop = direction === 'LONG' ? price * (1 - stopDist) : price * (1 + stopDist);
 const tp = direction === 'LONG' ? price * (1 + tpDist) : price * (1 - tpDist);
+
+// Statistik track record. Bila belum ada, semuanya nol dan gerbang akan menolak
+// dengan NO_TRACK_RECORD. Itu disengaja: tanpa bukti historis, tidak ada dasar
+// untuk menyatakan EV positif, dan "default DENY" berarti tidak menebak.
+const stats = snap.stats || { win_rate: 0, avg_win_pct: 0, avg_loss_pct: 0 };
 
 return [{ json: {
   signal: {
     id: `${$env.PIONEX_SYMBOL}-${new Date().toISOString().slice(0, 16)}`,
     direction, entry: price, stop, take_profit: tp,
     ts: new Date().toISOString(),
-    mirofish: $json.verdict || { schema_ok: false },
-    stats: $json.stats || { win_rate: 0, avg_win_pct: 0, avg_loss_pct: 0 },
+    // Baris mirofish_verdict sudah dalam bentuk amplop (schema_ok, confidence,
+    // event_risk, bias, verdict_ts) -- persis yang dibaca gerbang.
+    mirofish: verdict || { schema_ok: false },
+    stats,
   },
-  cfg, equity: Number($json.equity), entry: price,
+  cfg, equity: Number(state.equity || snap.equity || 0), entry: price,
   rules: {
-    symbol: $env.PIONEX_SYMBOL, base_step: Number(snap.instrument?.base_step || 0.0001),
-    quote_step: Number(snap.instrument?.quote_step || 0.01), min_size: 0, max_size: 1e9,
+    symbol: $env.PIONEX_SYMBOL,
+    base_step: Number(snap.instrument?.base_step || 0.0001),
+    quote_step: Number(snap.instrument?.quote_step || 0.01),
+    min_size: Number(snap.instrument?.min_size || 0),
+    max_size: Number(snap.instrument?.max_size || 1e9),
     min_notional: Number(snap.instrument?.min_notional || 5),
-    mmr: Number(snap.risk_table?.maint_margin_ratio || 0.005), taker_fee: 0.0005,
+    mmr: Number(snap.risk_table?.maint_margin_ratio || snap.risk_table?.maintMarginRatio || 0.005),
+    taker_fee: 0.0005,
   },
-  open_positions: Number($json.open_positions || 0),
-  breaker: $json.breaker || {},
+  open_positions: openPositions,
+  breaker: state.breaker || {},
 }}];
 """, (-400, 0)))
 

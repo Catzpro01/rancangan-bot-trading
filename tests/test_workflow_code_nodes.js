@@ -366,3 +366,135 @@ test('cek idempotensi ditandatangani dengan clientOrderId yang sama', async () =
   assert.ok(j.url.includes('clientOrderId=pg-ENTRY-0123456789abcdef01234567'), j.url);
   assert.ok(j.url.includes('symbol=BTC_USDT_PERP'), j.url);
 });
+
+// ---------------------------------------------------------------------------
+// Node dengan beberapa input. n8n bisa menyampaikan cabang-cabang itu sebagai
+// beberapa item TERPISAH; kode di dalamnya menggabungkan sendiri berdasarkan
+// bentuk data. Test di bawah memakai bentuk terpisah itu, bukan bentuk gabungan.
+// ---------------------------------------------------------------------------
+
+const DB_ROW = {
+  cfg: CFG, day_start_equity: 1000, peak_equity: 1050, consecutive_losses: 0,
+  halted: false, halt_reason: null, last_heartbeat: new Date().toISOString(),
+};
+
+test('preflight menggabungkan cabang terpisah menjadi satu record', async () => {
+  const wf = loadWorkflow('01-preflight-watchdog.json');
+  const out = await runNode(codeNode(wf, 'Gabung & hitung breaker'), {
+    items: [
+      { json: { req: 'balances', data: { balances: [
+        { type: 'PERP', availableBalance: '1234.5' },
+        { type: 'SPOT', availableBalance: '99' },          // tidak dihitung
+      ] } } },
+      { json: { req: 'leverage', data: { leverage: 50 } } },
+      { json: { req: 'isolated_mode', data: { isolatedMode: 'ISOLATED_BOTH' } } },
+      { json: { req: 'position_mode', data: { positionMode: 'BUYSELL' } } },
+      { json: { data: [{ maxLeverage: 100, maintMarginRatio: 0.005 }] } },
+      { json: structuredClone(DB_ROW) },
+    ],
+  });
+
+  assert.strictEqual(out.length, 1, 'harus menghasilkan tepat satu record');
+  const j = out[0].json;
+  assert.strictEqual(j.equity, 1234.5, 'hanya saldo PERP yang dihitung');
+  assert.deepStrictEqual(Object.keys(j.cfg).length > 0, true, 'cfg harus ikut terbawa');
+  assert.strictEqual(j.leverage.leverage, 50);
+  assert.strictEqual(j.isolated_mode.isolatedMode, 'ISOLATED_BOTH');
+  assert.strictEqual(j.risk_table.maxLeverage, 100);
+  assert.strictEqual(j.tripped, false, j.reason);
+});
+
+test('preflight menolak melanjutkan bila saldo tidak terbaca', async () => {
+  const wf = loadWorkflow('01-preflight-watchdog.json');
+  const out = await runNode(codeNode(wf, 'Gabung & hitung breaker'), {
+    items: [
+      { json: { req: 'balances', data: { balances: [] } } },
+      { json: structuredClone(DB_ROW) },
+    ],
+  });
+  assert.strictEqual(out[0].json.tripped, true);
+  assert.strictEqual(out[0].json.reason, 'EQUITY_READ_FAILED');
+});
+
+test('trading loop menggabungkan empat cabang menjadi satu sinyal', async () => {
+  const wf = loadWorkflow('03-trading-loop.json');
+  const klines = [];
+  for (let i = 0; i < 60; i += 1) {
+    klines.push({ close: String(100000 + i * 10) });   // tren naik -> LONG
+  }
+  const out = await runNode(codeNode(wf, 'Bangun sinyal'), {
+    env: { PIONEX_SYMBOL: 'BTC_USDT_PERP' },
+    items: [
+      { json: { cfg: CFG, day_start_equity: 1000, equity: 1000 } },
+      { json: { run_id: 'r1', verdict_ts: NOW_ISO(), schema_ok: true, bias: 'NEUTRAL',
+                confidence: 0.8, event_risk: 'LOW' } },
+      { json: { n: 0 } },
+      { json: { payload: { atr_1m: 300, klines,
+                           instrument: { base_step: 0.0001, min_notional: 5 },
+                           risk_table: { maintMarginRatio: 0.005 } } } },
+    ],
+  });
+
+  assert.strictEqual(out.length, 1);
+  const j = out[0].json;
+  assert.strictEqual(j.signal.direction, 'LONG');
+  assert.strictEqual(j.signal.mirofish.schema_ok, true, 'amplop verdict harus menempel');
+  assert.strictEqual(j.open_positions, 0);
+  assert.strictEqual(j.equity, 1000);
+  assert.strictEqual(j.rules.mmr, 0.005);
+  assert.ok(j.signal.entry > 0);
+  assert.ok(j.signal.stop < j.signal.entry);
+});
+
+test('tanpa track record, gerbang menolak sinyal dari trading loop', async () => {
+  const wf = loadWorkflow('03-trading-loop.json');
+  const klines = [];
+  for (let i = 0; i < 60; i += 1) klines.push({ close: String(100000 + i * 10) });
+  const signalOut = await runNode(codeNode(wf, 'Bangun sinyal'), {
+    env: { PIONEX_SYMBOL: 'BTC_USDT_PERP' },
+    items: [
+      { json: { cfg: CFG, day_start_equity: 1000, equity: 1000 } },
+      { json: { n: 0 } },
+      { json: { payload: { atr_1m: 300, klines } } },
+    ],
+  });
+  assert.strictEqual(signalOut[0].json.signal.mirofish.schema_ok, false,
+    'tanpa verdict, gerbang harus menolak');
+
+  const gate = await runNode(codeNode(wf, 'GERBANG RISIKO (default DENY)'), {
+    items: [{ json: { ...signalOut[0].json,
+                      rules: { ...RULES, mmr: 0.005 } } }],
+  });
+  assert.strictEqual(gate[0].json.approved, false);
+  assert.ok(gate[0].json.reasons.includes('NO_TRACK_RECORD'),
+    JSON.stringify(gate[0].json.reasons));
+  assert.ok(gate[0].json.reasons.includes('MIROFISH_SCHEMA_INVALID'));
+});
+
+test('monitor menggabungkan posisi bursa dengan state DB per posisi', async () => {
+  const wf = loadWorkflow('04-position-monitor.json');
+  const out = await runNode(codeNode(wf, 'Hitung trailing & exit'), {
+    env: { PIONEX_SYMBOL: 'BTC_USDT_PERP' },
+    items: [
+      { json: { data: { positions: [
+        { positionId: 'pA', symbol: 'BTC_USDT_PERP', netSize: 0.0058,
+          markPrice: '101000', leverage: '50', isolatedMode: 'ISOLATED_BOTH' },
+        { positionId: 'pB', symbol: 'BTC_USDT_PERP', netSize: 0.004,
+          markPrice: '100500', leverage: '50', isolatedMode: 'ISOLATED_BOTH' },
+      ] } } },
+      { json: { position_id: 'pA', state: { stop: 99200, tp: 101640, highest: 100000,
+                                            lowest: 0, opened_at: NOW_ISO() } } },
+      { json: { payload: { atr_1m: 300 } } },
+    ],
+  });
+
+  assert.strictEqual(out.length, 2, 'satu record per posisi');
+  const a = out.find((x) => x.json.position.positionId === 'pA').json;
+  const b = out.find((x) => x.json.position.positionId === 'pB').json;
+
+  assert.ok(a.stop > 99200, `stop pA harus terangkat oleh ATR, dapat ${a.stop}`);
+  assert.strictEqual(a.reason, 'HOLD', a.reason);
+  assert.strictEqual(b.reason, 'ANOMALY:STOP_UNKNOWN',
+    'posisi tanpa state tidak boleh dibiarkan tanpa stop');
+  assert.strictEqual(b.exit, true);
+});

@@ -108,7 +108,9 @@ services:
     volumes:
       - mirofish_data:/app/data/mirofish
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8100/health')\" || exit 1"]
+      # Respons HTTP apa pun (termasuk 4xx/5xx) berarti prosesnya hidup; hanya
+      # kegagalan koneksi yang membuat healthcheck gagal.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,urllib.error\\ntry:\\n urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=5)\\nexcept urllib.error.HTTPError:\\n pass\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
