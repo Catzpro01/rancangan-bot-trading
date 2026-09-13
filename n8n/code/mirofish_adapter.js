@@ -16,16 +16,19 @@ const ADAPTER_VERSION = '1.0.0';
 // ("du-a naik"? "me-nurun") dan menghasilkan bias palsu. Lebih baik NEUTRAL.
 const LONG_WORDS = ['bullish', 'rally', 'uptrend', 'breakout', 'surge', 'buying pressure'];
 const SHORT_WORDS = ['bearish', 'selloff', 'sell-off', 'downtrend', 'dump', 'selling pressure'];
+// Bobot ini HARUS identik dengan daftar bobot di mirofish_runner/runner.py.
+// tests/verdict_cases.json dijalankan oleh kedua bahasa; bila salah satu diubah
+// tanpa yang lain, test paritas gagal.
 const RISK_WORDS = [
-  ['liquidation', 0.35], ['likuidasi', 0.35], ['hack', 0.4], ['exploit', 0.4],
-  ['rug pull', 0.4], ['depeg', 0.4], ['insolven', 0.4], ['insolvent', 0.4],
-  ['sec ', 0.3], ['regulator', 0.25], ['ban', 0.3], ['lawsuit', 0.3], ['gugatan', 0.3],
-  ['fomc', 0.3], ['cpi', 0.3], ['nfp', 0.25], ['etf decision', 0.3],
-  ['expiry', 0.2], ['black swan', 0.45], ['crash', 0.4], ['panic', 0.3],
-  ['delisting', 0.3], ['outage', 0.25], ['maintenance darurat', 0.3],
-  ['pengumuman', 0.2], ['kebijakan', 0.2], ['sanksi', 0.3], ['default', 0.3],
-  ['volatilitas tinggi', 0.3], ['ketidakpastian', 0.25], ['intervensi', 0.3],
+  ['hack', 0.4], ['exploit', 0.4], ['rug pull', 0.4], ['depeg', 0.4],
+  ['insolvent', 0.4], ['insolven', 0.4], ['black swan', 0.45], ['crash', 0.4],
+  ['lawsuit', 0.3], ['gugatan', 0.3], ['delisting', 0.3], ['sanksi', 0.3],
+  ['regulator', 0.25], ['panic', 0.3], ['kepanikan', 0.3], ['ban', 0.3],
+  ['default', 0.3], ['outage', 0.25], ['likuidasi', 0.25], ['pengumuman', 0.2],
+  ['kebijakan', 0.2], ['intervensi', 0.3], ['ketidakpastian', 0.25],
+  ['volatilitas tinggi', 0.3],
 ];
+const LOW_WORDS = ['stable', 'stabil', 'calm', 'tenang', 'normal', 'sideways'];
 
 function clamp01(x) {
   const n = Number(x);
@@ -62,18 +65,28 @@ function detectBias(text) {
   return 'NEUTRAL';
 }
 
+// Kata kunci pendek (<= 4 huruf, mis. 'ban') hanya dihitung sebagai kata utuh.
+// Tanpa ini 'ban' cocok di dalam 'besar' atau 'banjir' dan verdict tenang terbaca
+// sebagai risiko sedang.
+function hitCount(t, w) {
+  if (w.length > 4) return t.includes(w) ? 1 : 0;
+  const re = new RegExp(`(?<![a-z0-9])${w}(?![a-z0-9])`, 'g');
+  return (t.match(re) || []).length > 0 ? 1 : 0;
+}
+
 function detectEventRisk(text) {
   const t = String(text || '').toLowerCase();
   let score = 0;
   const hits = [];
   for (const [w, weight] of RISK_WORDS) {
-    if (t.includes(w)) {
-      score += weight;
-      hits.push(w);
-    }
+    if (hitCount(t, w)) { score += weight; hits.push(w); }
   }
+  for (const w of LOW_WORDS) {
+    if (hitCount(t, w)) { score -= 0.1; hits.push(`-${w}`); }
+  }
+  score = Math.max(0, Math.min(1, score));
   const level = score >= 0.66 ? 'HIGH' : score >= 0.33 ? 'MEDIUM' : 'LOW';
-  return { level, score: Math.min(1, score), hits };
+  return { level, score: Math.round(score * 10000) / 10000, hits };
 }
 
 function pickConfidence(verdict) {
@@ -105,12 +118,27 @@ function toEnvelope(raw) {
   const manifest = raw?.manifest || raw?.data?.manifest || null;
   const runId = raw?.run_id || manifest?.run_id || raw?.job_id || null;
 
+  // Timestamp dihitung LEBIH DULU dan ikut dibawa pada jalur veto.
+  // Alasannya konkret: mirofish_verdict.verdict_ts NOT NULL, jadi veto tanpa
+  // timestamp gagal di-INSERT dan jejak auditnya hilang -- kegagalan senyap yang
+  // justru muncul saat ada yang tidak beres.
+  const tsRaw = manifest?.created_at || verdict?.generated_at || verdict?.timestamp
+    || raw?.created_at;
+  let verdictTs = null;
+  if (tsRaw) {
+    const t = Date.parse(String(tsRaw).replace(' ', 'T'));
+    if (!Number.isNaN(t)) verdictTs = new Date(t).toISOString().replace('.000Z', 'Z');
+    else notes.push('UNPARSEABLE_TIMESTAMP');
+  } else {
+    notes.push('TIMESTAMP_MISSING');
+  }
+
   const base = {
     run_id: runId,
-    verdict_ts: null,
+    verdict_ts: verdictTs,
     schema_ok: false,
     bias: 'NEUTRAL',
-    confidence: 0,
+    confidence: null,     // null, bukan 0: "tidak ada data" bukan "confidence nol"
     event_risk: 'HIGH',   // default paling konservatif
     horizon_hours: 24,
     evidence: [],
@@ -139,16 +167,7 @@ function toEnvelope(raw) {
   const risk = detectEventRisk(riskText);
   const bias = detectBias(prediction + '\n' + textOf(verdict.signals));
 
-  const tsRaw = manifest?.created_at || verdict.generated_at || verdict.timestamp || raw?.created_at;
-  let verdictTs = null;
-  if (tsRaw) {
-    const t = Date.parse(String(tsRaw).replace(' ', 'T'));
-    if (!Number.isNaN(t)) verdictTs = new Date(t).toISOString().replace('.000Z', 'Z');
-    else notes.push('UNPARSEABLE_TIMESTAMP');
-  } else {
-    notes.push('TIMESTAMP_MISSING');
-  }
-  if (!verdictTs) return { ...base, notes };
+  if (!verdictTs) return base;
 
   return {
     run_id: runId,
@@ -157,6 +176,7 @@ function toEnvelope(raw) {
     bias,
     confidence: clamp01(conf.value),
     event_risk: risk.level,
+    risk_score: risk.score,
     horizon_hours: Number(verdict.horizon_hours || 24),
     evidence: (verdict.key_dynamics || verdict.signals || []).slice(0, 10),
     adapter_version: ADAPTER_VERSION,

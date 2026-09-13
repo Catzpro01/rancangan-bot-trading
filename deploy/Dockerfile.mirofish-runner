@@ -1,0 +1,20 @@
+# deploy/Dockerfile.mirofish-runner
+# Lapisan HTTP mirofish_runner. Untuk produksi, tambahkan CLI MiroFish di atas
+# image dasarnya (lihat docs/07 §5) — dependensi camel-ai/OASIS terlalu berat
+# untuk dipasang ulang tiap build.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir fastapi==0.115.* "uvicorn[standard]==0.32.*"
+
+COPY mirofish_runner /app/mirofish_runner
+
+ENV PYTHONUNBUFFERED=1 \
+    MIROFISH_RUNNER_DATA=/app/data/mirofish
+
+EXPOSE 8100
+
+# `timeout` mencegah satu job menggantung selamanya; runner sendiri juga punya
+# MIROFISH_TIMEOUT_SEC sebagai batas subprocess.
+CMD ["uvicorn", "mirofish_runner.app:app", "--host", "0.0.0.0", "--port", "8100"]

@@ -1,0 +1,124 @@
+# deploy/docker-compose.yml — tumpukan self-hosted untuk bot.
+#
+# Dijalankan:  docker compose --env-file .env -f deploy/docker-compose.yml up -d
+#
+# Catatan penting:
+#   * Postgres TIDAK dipublikasikan ke host. Hanya n8n yang boleh menyentuhnya.
+#   * n8n dipublikasikan ke 127.0.0.1 saja; taruh reverse proxy + TLS di depannya
+#     (lihat docs/07 §3). Jangan pernah membuka 5678 ke internet tanpa itu.
+#   * mirofish-runner tidak dipublikasikan sama sekali: hanya n8n yang memanggilnya,
+#     lewat jaringan internal.
+#   * Semua rahasia lewat .env, tidak ada nilai rahasia di berkas ini.
+
+name: pionex-bot
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Skema dibuat otomatis saat volume masih kosong. Untuk perubahan skema
+      # sesudahnya jalankan manual: psql "$DATABASE_URL" -f db/schema.sql
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    networks: [internal]
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:5678:5678"
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_HOST: ${N8N_HOST}
+      N8N_PROTOCOL: https
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZE_ENABLED: "false"
+      N8N_RUNNERS_ENABLED: "true"
+      # Code node butuh akses ke modul Node bawaan; sandbox luar dimatikan agar
+      # `require` di dalam Code node berfungsi (dipakai kode guard risiko).
+      NODE_FUNCTION_ALLOW_BUILTIN: "*"
+      EXECUTIONS_TIMEOUT: 120
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: 336
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}
+      TZ: ${TZ}
+      # Variabel yang dibaca Code node lewat $env. n8n meneruskan environment
+      # prosesnya ke Code node, jadi rahasia cukup didefinisikan di sini.
+      PIONEX_API_KEY: ${PIONEX_API_KEY}
+      PIONEX_API_SECRET: ${PIONEX_API_SECRET}
+      PIONEX_SYMBOL: ${PIONEX_SYMBOL}
+      PIONEX_BASE_URL: ${PIONEX_BASE_URL}
+      MIROFISH_RUNNER_URL: http://mirofish-runner:8100
+      MIROFISH_RUNNER_TOKEN: ${MIROFISH_RUNNER_TOKEN}
+      ALERT_EMAIL: ${ALERT_EMAIL}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks: [internal]
+
+  mirofish-runner:
+    # Untuk produksi, ganti `build` dengan image yang sudah berisi CLI MiroFish
+    # beserta dependensinya (camel-ai/OASIS itu berat). Dockerfile di sini hanya
+    # menjalankan lapisan HTTP-nya; lihat docs/07 §5.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.mirofish-runner
+    restart: unless-stopped
+    environment:
+      MIROFISH_RUNNER_TOKEN: ${MIROFISH_RUNNER_TOKEN}
+      MIROFISH_RUNNER_DATA: ${MIROFISH_RUNNER_DATA:-data/mirofish}
+      MIROFISH_ARTIFACTS: ${MIROFISH_ARTIFACTS:-data/mirofish/runs}
+      MIROFISH_BIN: ${MIROFISH_BIN:-mirofish}
+      MIROFISH_MAX_ROUNDS: ${MIROFISH_MAX_ROUNDS:-10}
+      MIROFISH_PLATFORM: ${MIROFISH_PLATFORM:-parallel}
+      MIROFISH_TIMEOUT_SEC: ${MIROFISH_TIMEOUT_SEC:-3600}
+      MIROFISH_FAKE: ${MIROFISH_FAKE:-0}
+      MIROFISH_CWD: ${MIROFISH_CWD:-}
+    volumes:
+      - mirofish_data:/app/data/mirofish
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8100/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks: [internal]
+
+volumes:
+  pgdata:
+  n8n_data:
+  mirofish_data:
+
+networks:
+  internal:
+    driver: bridge

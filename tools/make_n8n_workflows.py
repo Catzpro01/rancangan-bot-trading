@@ -73,11 +73,13 @@ for (const item of items) {
     price: String(roundStep(j.entry, j.rules.quote_step)),
     reduceOnly: false,
   });
+  const path = '/uapi/v1/trade/order';
   const timestamp = Date.now();
-  const signature = signPionex('POST', '/uapi/v1/trade/order', { timestamp }, body,
-                               $env.PIONEX_API_SECRET);
+  const signature = signPionex('POST', path, { timestamp }, body, $env.PIONEX_API_SECRET);
+  const base = $env.PIONEX_BASE_URL || 'https://api.pionex.com';
 
   out.push({ json: { ...j, send: true, clientOrderId, body, timestamp, signature,
+                     url: `${base}${path}?timestamp=${timestamp}`,
                      request_hash: require('crypto').createHash('sha256').update(body).digest('hex') } });
 }
 return out;
@@ -138,7 +140,31 @@ const timestamp = Date.now();
 const path = '/uapi/v1/trade/allOrders';
 const body = JSON.stringify({ symbol: $env.PIONEX_SYMBOL || 'BTC_USDT_PERP' });
 const signature = signPionex('DELETE', path, { timestamp }, body, $env.PIONEX_API_SECRET);
-return [{ json: { path, timestamp, body, signature, killed_at: new Date().toISOString() } }];
+const base = $env.PIONEX_BASE_URL || 'https://api.pionex.com';
+return [{ json: { path, timestamp, body, signature, url: `${base}${path}?timestamp=${timestamp}`,
+                  killed_at: new Date().toISOString() } }];
+"""
+
+ENTRY_SIGN_CHECK = """
+// ---- entry point n8n: tanda tangan pemeriksaan idempotensi --------------------------
+// Setelah POST order, kebenaran TIDAK boleh diasumsikan dari timeout. Order dicek
+// ulang lewat clientOrderId; permintaan itu juga bertanda tangan, jadi dihitung di sini.
+const out = [];
+for (const item of items) {
+  const j = item.json;
+  if (!j.clientOrderId) continue;
+  const path = '/uapi/v1/trade/orderByClientOrderId';
+  const query = {
+    clientOrderId: j.clientOrderId,
+    symbol: $env.PIONEX_SYMBOL || (j.signal && j.signal.symbol) || '',
+    timestamp: Date.now(),
+  };
+  const signature = signPionex('GET', path, query, null, $env.PIONEX_API_SECRET);
+  const qs = Object.keys(query).sort().map((k) => `${k}=${query[k]}`).join('&');
+  const base = $env.PIONEX_BASE_URL || 'https://api.pionex.com';
+  out.push({ json: { ...j, path, query, url: `${base}${path}?${qs}`, signature } });
+}
+return out;
 """
 
 ENTRY_ADAPTER = """
@@ -169,7 +195,8 @@ for (const item of items) {
   const dd = peak > 0 ? ((peak - equity) / peak) * 100 : 0;
 
   let tripped = false, reason = '';
-  if (dayPnl <= -cfg.max_daily_loss_pct) { tripped = true; reason = `DAILY_LOSS ${dayPnl.toFixed(2)}%`; }
+  if (j.halted === true || j.halted === 't') { tripped = true; reason = `HALTED ${j.halt_reason || 'UNKNOWN'}`; }
+  else if (dayPnl <= -cfg.max_daily_loss_pct) { tripped = true; reason = `DAILY_LOSS ${dayPnl.toFixed(2)}%`; }
   else if (dd >= cfg.max_drawdown_pct) { tripped = true; reason = `DRAWDOWN ${dd.toFixed(2)}%`; }
   else if (consec >= cfg.max_consecutive_losses) { tripped = true; reason = `CONSEC_LOSSES ${consec}`; }
 
@@ -365,12 +392,55 @@ def notify(name: str, position=(700, 200)) -> dict:
 
 
 BASE = "https://api.pionex.com"
-TS = "={{ Date.now() }}"
+
+# Template URL untuk HTTP Request node. PENTING: URL, timestamp, dan tanda tangan
+# semuanya berasal dari SATU Code node di hulunya. Kalau URL dibangun di node HTTP
+# sementara tanda tangan dihitung di tempat lain, keduanya bisa menyimpang dan bursa
+# menolak dengan signature mismatch -- kegagalan yang sulit dilacak karena "kode
+# terlihat benar".
+URL_FROM_ITEM = "={{ $json.url }}"
 SIG_HEADERS = {
     "PIONEX-KEY": "={{ $env.PIONEX_API_KEY }}",
     "PIONEX-SIGNATURE": "={{ $json.signature }}",
     "Content-Type": "application/json",
 }
+READ_HEADERS = {
+    "PIONEX-KEY": "={{ $env.PIONEX_API_KEY }}",
+    "PIONEX-SIGNATURE": "={{ $json.signature }}",
+}
+
+# n8n Code node "Run Once for All Items" menerima setiap item dari node sebelumnya.
+# Jadi satu Code node penanda tangan + satu HTTP node bisa melayani N endpoint.
+SIGNED_READS = """
+// ---- entry point n8n: tanda tangan permintaan baca ------------------------------
+// Pionex menuntut timestamp dalam rentang +-20 detik dan tanda tangan HMAC atas
+// METHOD + path + query tersortir. Keduanya harus dihitung saat permintaan dibuat,
+// tidak bisa disimpan di environment: tanda tangan statis akan kedaluwarsa dalam
+// 20 detik dan setiap panggilan akan ditolak.
+const PATHS = __PATHS__;
+const out = [];
+for (const p of PATHS) {
+  const query = Object.assign({ timestamp: Date.now() }, p.query || {});
+  const signature = signPionex(p.method || 'GET', p.path, query, null, $env.PIONEX_API_SECRET);
+  const qs = Object.keys(query).sort().map((k) => `${k}=${query[k]}`).join('&');
+  out.push({ json: {
+    req: p.req, method: p.method || 'GET', path: p.path, query, timestamp: query.timestamp,
+    url: `${$env.PIONEX_BASE_URL || 'https://api.pionex.com'}${p.path}?${qs}`,
+    signature,
+  } });
+}
+return out;
+"""
+
+
+def signed_reads(name: str, paths: list[tuple[str, str, dict | None]], position=(-600, 0)) -> tuple[dict, dict]:
+    """Bangun pasangan (Code node penanda tangan, HTTP Request node)."""
+    import json as _json
+    literal = _json.dumps([{"req": r, "path": p, "query": q, "method": "GET"}
+                           for r, p, q in paths], ensure_ascii=False)
+    return (code(name, guard_body(SIGNED_READS.replace("__PATHS__", literal)), position),
+            http(f"{name} (HTTP)", "GET", URL_FROM_ITEM, (position[0] + 220, position[1]),
+                 headers=READ_HEADERS))
 
 
 # --------------------------------------------------------------------------------------
@@ -382,20 +452,26 @@ def build_preflight() -> dict:
     f = Flow("Pionex Guard — 01 Preflight & Watchdog")
     f.add(schedule("Setiap 30 detik", {"field": "seconds", "secondsInterval": 30}))
 
-    f.add(http("Ambil leverage", "GET", f"{BASE}/uapi/v1/account/leverage?timestamp={TS}", (-700, -200),
-               headers={"PIONEX-KEY": "={{ $env.PIONEX_API_KEY }}",
-                        "PIONEX-SIGNATURE": "={{ $env.PIONEX_STATIC_READ_SIGNATURE }}"}))
-    f.add(http("Ambil mode margin", "GET", f"{BASE}/uapi/v1/trade/isolatedMode?timestamp={TS}", (-700, -60),
-               headers={"PIONEX-KEY": "={{ $env.PIONEX_API_KEY }}",
-                        "PIONEX-SIGNATURE": "={{ $env.PIONEX_STATIC_READ_SIGNATURE }}"}))
-    f.add(http("Ambil saldo", "GET", f"{BASE}/uapi/v1/account/balances?timestamp={TS}", (-700, 80),
-               headers={"PIONEX-KEY": "={{ $env.PIONEX_API_KEY }}",
-                        "PIONEX-SIGNATURE": "={{ $env.PIONEX_STATIC_READ_SIGNATURE }}"}))
+    # Config + state dibaca LEBIH DULU: cfg.leverage adalah pembanding untuk setelan
+    # akun, dan tanpa baris bot_state seluruh pemeriksaan tidak punya acuan.
+    f.add(postgres("Baca config & state", "executeQuery",
+                   "SELECT cfg, day_start_equity, peak_equity, consecutive_losses, halted, "
+                   "halt_reason, last_heartbeat, last_market_beat "
+                   "FROM bot_state ORDER BY id DESC LIMIT 1;", (-900, 0)))
+
+    sign_node, http_node = signed_reads("Tanda tangan baca akun", [
+        ("leverage", "/uapi/v1/account/leverage", None),
+        ("isolated_mode", "/uapi/v1/trade/isolatedMode", None),
+        ("position_mode", "/uapi/v1/account/positionMode", None),
+        ("balances", "/uapi/v1/account/balances", None),
+    ], (-700, 0))
+    f.add(sign_node)
+    f.add(http_node)
+
+    # Endpoint publik: tidak perlu tanda tangan.
     f.add(http("Ambil risk table", "GET",
-               f"{BASE}/api/v1/common/riskTable?symbol={{{{ $env.PIONEX_SYMBOL }}}}", (-700, 220)))
-    f.add(postgres("Baca state akun", "executeQuery",
-                   "SELECT day_start_equity, peak_equity, consecutive_losses, last_heartbeat "
-                   "FROM bot_state ORDER BY id DESC LIMIT 1;", (-700, 360)))
+               "{{ $env.PIONEX_BASE_URL || 'https://api.pionex.com' }}/api/v1/common/riskTable"
+               "?symbol={{ $env.PIONEX_SYMBOL }}", (-700, 300)))
 
     f.add(code("Gabung & hitung breaker", guard_body(ENTRY_BREAKER), (-400, 0)))
     f.add(code("Periksa setelan akun", guard_body(ENTRY_PREFLIGHT_CHECK), (-150, 0)))
@@ -405,21 +481,26 @@ def build_preflight() -> dict:
     f.add(postgres("Perbarui state", "executeQuery",
                    "UPDATE bot_state SET peak_equity = GREATEST(peak_equity, {{ $json.equity }}), "
                    "updated_at = now() WHERE id = (SELECT max(id) FROM bot_state);", (700, -140)))
-    f.add(http("Batal semua order", "DELETE", f"{BASE}/uapi/v1/trade/allOrders?timestamp={{ $json.timestamp }}",
-               (700, 140), body="={{ $json.body }}", headers=SIG_HEADERS))
-    f.add(notify("Notifikasi HALT", (950, 140)))
 
-    f.link("Setiap 30 detik", "Ambil leverage")
-    f.link("Setiap 30 detik", "Ambil mode margin")
-    f.link("Setiap 30 detik", "Ambil saldo")
+    # Jalur HALT: cancel-all adalah permintaan BERTANDA TANGAN, jadi butuh Code node
+    # yang menghitung HMAC-nya saat itu juga.
+    f.add(code("Tanda tangan cancel-all", guard_body(ENTRY_KILLSWITCH), (450, 200)))
+    f.add(http("Batal semua order", "DELETE", URL_FROM_ITEM, (700, 200),
+               body="={{ $json.body }}", headers=SIG_HEADERS))
+    f.add(notify("Notifikasi HALT", (950, 200)))
+
+    f.link("Setiap 30 detik", "Baca config & state")
+    f.link("Baca config & state", "Tanda tangan baca akun")
+    f.link("Tanda tangan baca akun", "Tanda tangan baca akun (HTTP)")
     f.link("Setiap 30 detik", "Ambil risk table")
-    f.link("Setiap 30 detik", "Baca state akun")
-    for src in ("Ambil leverage", "Ambil mode margin", "Ambil saldo", "Ambil risk table", "Baca state akun"):
-        f.link(src, "Gabung & hitung breaker")
+    f.link("Tanda tangan baca akun (HTTP)", "Gabung & hitung breaker")
+    f.link("Ambil risk table", "Gabung & hitung breaker")
+    f.link("Baca config & state", "Gabung & hitung breaker")
     f.link("Gabung & hitung breaker", "Periksa setelan akun")
     f.link("Periksa setelan akun", "Sehat?")
     f.link("Sehat?", "Perbarui state", "main", 0)
-    f.link("Sehat?", "Batal semua order", "main", 1)
+    f.link("Sehat?", "Tanda tangan cancel-all", "main", 1)
+    f.link("Tanda tangan cancel-all", "Batal semua order")
     f.link("Batal semua order", "Notifikasi HALT")
     return f.json()
 
@@ -568,13 +649,10 @@ return [{ json: {
                    "VALUES ('{{ $json.clientOrderId }}', '{{ $json.signal.id }}', 'SENDING', "
                    "'{{ $json.request_hash }}', '{{ $json.body }}'::jsonb) "
                    "ON CONFLICT (client_order_id) DO NOTHING;", (650, 60)))
-    f.add(http("Kirim order", "POST", f"{BASE}/uapi/v1/trade/order?timestamp={{ $json.timestamp }}",
-               (900, 160), body="={{ $json.body }}", headers=SIG_HEADERS))
-    f.add(http("Cek idempotensi", "GET",
-               f"{BASE}/uapi/v1/trade/orderByClientOrderId?timestamp={TS}"
-               "&symbol={{ $env.PIONEX_SYMBOL }}&clientOrderId={{ $json.clientOrderId }}",
-               (1150, 300), headers={"PIONEX-KEY": "={{ $env.PIONEX_API_KEY }}",
-                                     "PIONEX-SIGNATURE": "={{ $env.PIONEX_STATIC_READ_SIGNATURE }}"}))
+    f.add(http("Kirim order", "POST", URL_FROM_ITEM, (900, 160),
+               body="={{ $json.body }}", headers=SIG_HEADERS))
+    f.add(code("Tanda tangan cek idempotensi", guard_body(ENTRY_SIGN_CHECK), (1150, 300)))
+    f.add(http("Cek idempotensi", "GET", URL_FROM_ITEM, (1400, 300), headers=READ_HEADERS))
     f.add(postgres("Catat keputusan disetujui", "executeQuery",
                    "INSERT INTO trade_decision (signal_id, approved, reasons, warnings, payload) "
                    "VALUES ('{{ $json.signal.id }}', true, '[]'::jsonb, "
@@ -594,8 +672,9 @@ return [{ json: {
     f.link("Bangun order + tanda tangan", "Catat order (SENDING)")
     f.link("Catat order (SENDING)", "Kirim order")
     f.link("Kirim order", "Catat keputusan disetujui")
-    f.link("Kirim order", "Cek idempotensi", "main", 0)
     f.link("Catat keputusan disetujui", "Tulis heartbeat loop")
+    f.link("Tulis heartbeat loop", "Tanda tangan cek idempotensi")
+    f.link("Tanda tangan cek idempotensi", "Cek idempotensi")
     return f.json()
 
 
@@ -607,9 +686,11 @@ return [{ json: {
 def build_monitor() -> dict:
     f = Flow("Pionex Guard — 04 Position Monitor")
     f.add(schedule("Setiap 15 detik", {"field": "seconds", "secondsInterval": 15}))
-    f.add(http("Ambil posisi", "GET", f"{BASE}/uapi/v1/account/positions?timestamp={TS}", (-700, 0),
-               headers={"PIONEX-KEY": "={{ $env.PIONEX_API_KEY }}",
-                        "PIONEX-SIGNATURE": "={{ $env.PIONEX_STATIC_READ_SIGNATURE }}"}))
+    _sn, _hn = signed_reads("Tanda tangan baca posisi", [
+        ("positions", "/uapi/v1/account/positions", None),
+    ], (-900, 0))
+    f.add(_sn)
+    f.add(_hn)
     f.add(postgres("Baca state posisi", "executeQuery",
                    "SELECT * FROM open_position WHERE closed_at IS NULL;", (-700, 140)))
     f.add(code("Hitung trailing & exit", guard_body(ENTRY_MONITOR), (-350, 0)))
@@ -632,8 +713,8 @@ for (const item of items) {
 }
 return out;
 """), (400, 160)))
-    f.add(http("Kirim exit", "POST", f"{BASE}/uapi/v1/trade/order?timestamp={{ $json.timestamp }}",
-               (650, 160), body="={{ $json.body }}", headers=SIG_HEADERS))
+    f.add(http("Kirim exit", "POST", URL_FROM_ITEM, (650, 160),
+               body="={{ $json.body }}", headers=SIG_HEADERS))
     f.add(postgres("Tutup posisi", "executeQuery",
                    "UPDATE open_position SET closed_at = now(), close_reason = '{{ $json.reason }}' "
                    "WHERE position_id = '{{ $json.position.positionId }}';", (900, 160)))
@@ -642,9 +723,10 @@ return out;
                    "state = '{{ JSON.stringify($json.state) }}'::jsonb "
                    "WHERE position_id = '{{ $json.position.positionId }}';", (400, -140)))
 
-    f.link("Setiap 15 detik", "Ambil posisi")
+    f.link("Setiap 15 detik", "Tanda tangan baca posisi")
+    f.link("Tanda tangan baca posisi", "Tanda tangan baca posisi (HTTP)")
     f.link("Setiap 15 detik", "Baca state posisi")
-    f.link("Ambil posisi", "Hitung trailing & exit")
+    f.link("Tanda tangan baca posisi (HTTP)", "Hitung trailing & exit")
     f.link("Baca state posisi", "Hitung trailing & exit")
     f.link("Hitung trailing & exit", "Perlu exit?")
     f.link("Perlu exit?", "Bangun order exit", "main", 0)
@@ -663,12 +745,13 @@ def build_killswitch() -> dict:
     f = Flow("Pionex Guard — 05 Kill Switch")
     f.add(webhook("Webhook kill", "pionex-guard/kill", "POST"))
     f.add(code("Tanda tangan cancel-all", guard_body(ENTRY_KILLSWITCH), (-500, 0)))
-    f.add(http("Batal semua order", "DELETE",
-               f"{BASE}/uapi/v1/trade/allOrders?timestamp={{ $json.timestamp }}", (-250, 0),
+    f.add(http("Batal semua order", "DELETE", URL_FROM_ITEM, (-250, 0),
                body="={{ $json.body }}", headers=SIG_HEADERS))
-    f.add(http("Ambil posisi", "GET", f"{BASE}/uapi/v1/account/positions?timestamp={TS}", (0, 0),
-               headers={"PIONEX-KEY": "={{ $env.PIONEX_API_KEY }}",
-                        "PIONEX-SIGNATURE": "={{ $env.PIONEX_STATIC_READ_SIGNATURE }}"}))
+    _sn2, _hn2 = signed_reads("Tanda tangan baca posisi", [
+        ("positions", "/uapi/v1/account/positions", None),
+    ], (-100, 0))
+    f.add(_sn2)
+    f.add(_hn2)
     f.add(code("Bangun order perataan", guard_body("""
 const out = [];
 const positions = (items[0]?.json?.data?.positions) || [];
@@ -690,8 +773,8 @@ if (!out.length) out.push({ json: { body: null, skip: true } });
 return out;
 """), (250, 0)))
     f.add(if_node("Ada posisi?", [cond("={{ $json.skip }}", "false", False)]))
-    f.add(http("Ratakan posisi", "POST", f"{BASE}/uapi/v1/trade/order?timestamp={{ $json.timestamp }}",
-               (500, -100), body="={{ $json.body }}", headers=SIG_HEADERS))
+    f.add(http("Ratakan posisi", "POST", URL_FROM_ITEM, (500, -100),
+               body="={{ $json.body }}", headers=SIG_HEADERS))
     f.add(postgres("Set HALTED", "executeQuery",
                    "UPDATE bot_state SET halted = true, halt_reason = 'MANUAL_KILL', "
                    "halted_at = now() WHERE id = (SELECT max(id) FROM bot_state);", (500, 100)))
@@ -699,8 +782,9 @@ return out;
 
     f.link("Webhook kill", "Tanda tangan cancel-all")
     f.link("Tanda tangan cancel-all", "Batal semua order")
-    f.link("Batal semua order", "Ambil posisi")
-    f.link("Ambil posisi", "Bangun order perataan")
+    f.link("Batal semua order", "Tanda tangan baca posisi")
+    f.link("Tanda tangan baca posisi", "Tanda tangan baca posisi (HTTP)")
+    f.link("Tanda tangan baca posisi (HTTP)", "Bangun order perataan")
     f.link("Bangun order perataan", "Ada posisi?")
     f.link("Ada posisi?", "Ratakan posisi", "main", 0)
     f.link("Ada posisi?", "Set HALTED", "main", 1)
@@ -734,7 +818,7 @@ return [{ json: {
                body='={{ JSON.stringify({ requirement: $json.requirement, files: $json.files, '
                     'platform: $json.platform, max_rounds: $json.max_rounds }) }}',
                headers={"Content-Type": "application/json",
-                        "X-Runner-Token": "={{ $env.MIROFISH_RUNNER_TOKEN }}"}))
+                        "Authorization": "=Bearer {{ $env.MIROFISH_RUNNER_TOKEN }}"}))
     f.add(postgres("Catat job", "executeQuery",
                    "INSERT INTO mirofish_run_log (job_id, symbol, status, started_at) "
                    "VALUES ('{{ $json.data.job_id || $json.job_id }}', '{{ $env.PIONEX_SYMBOL }}', "
@@ -743,19 +827,21 @@ return [{ json: {
     f.add(postgres("Ambil job berjalan", "executeQuery",
                    "SELECT job_id FROM mirofish_run_log WHERE status = 'RUNNING' "
                    "ORDER BY started_at LIMIT 1;", (-600, 300)))
-    f.add(http("Cek status", "GET", f"{runner}/jobs/{{ $json.job_id }}", (-350, 300),
-               headers={"X-Runner-Token": "={{ $env.MIROFISH_RUNNER_TOKEN }}"}))
-    f.add(if_node("Selesai?", [cond("={{ $json.data.status || $json.status }}", "equals", "COMPLETED")]))
+    f.add(http("Cek status", "GET", f"{runner}/jobs/{{{{ $json.job_id }}}}", (-350, 300),
+               headers={"Authorization": "=Bearer {{ $env.MIROFISH_RUNNER_TOKEN }}"}))
+    f.add(if_node("Selesai?", [cond("={{ $json.status }}", "equals", "SUCCEEDED")]))
     f.add(http("Ambil verdict", "GET",
-               f"{runner}/jobs/{{ $json.job_id }}/verdict", (150, 200),
-               headers={"X-Runner-Token": "={{ $env.MIROFISH_RUNNER_TOKEN }}"}))
+               f"{runner}/jobs/{{{{ $json.job_id }}}}/verdict", (150, 200),
+               headers={"Authorization": "=Bearer {{ $env.MIROFISH_RUNNER_TOKEN }}"}))
     f.add(code("Adapter verdict", adapter_body(), (400, 200)))
     f.add(postgres("Simpan verdict", "executeQuery",
                    "INSERT INTO mirofish_verdict (run_id, verdict_ts, schema_ok, bias, confidence, "
-                   "event_risk, horizon_hours, evidence, adapter_version, raw) "
+                   "event_risk, horizon_hours, risk_score, evidence, adapter_version, raw) "
                    "VALUES ('{{ $json.run_id }}', '{{ $json.verdict_ts }}', {{ $json.schema_ok }}, "
                    "'{{ $json.bias }}', {{ $json.confidence }}, '{{ $json.event_risk }}', "
-                   "{{ $json.horizon_hours }}, '{{ JSON.stringify($json.evidence) }}'::jsonb, "
+                   "{{ $json.horizon_hours }}, "
+                   "{{ $json.risk_score === undefined || $json.risk_score === null ? 1 : $json.risk_score }}, "
+                   "'{{ JSON.stringify($json.evidence) }}'::jsonb, "
                    "'{{ $json.adapter_version }}', '{{ JSON.stringify($json) }}'::jsonb) "
                    "ON CONFLICT (run_id) DO NOTHING;", (650, 200)))
     f.add(notify("Notifikasi veto", (650, 380)))

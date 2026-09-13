@@ -1,0 +1,115 @@
+{
+  "_comment": [
+    "Fixture paritas Python <-> JavaScript untuk normalisasi verdict MiroFish.",
+    "Dipakai oleh tests/test_mirofish_runner.py (runner.normalize_verdict) dan",
+    "tests/test_mirofish_verdict_parity.js (mirofish_adapter.toEnvelope).",
+    "Keduanya harus menghasilkan empat field ini SAMA PERSIS. Bila salah satu",
+    "diubah, ubah keduanya -- atau ubah fixture ini secara sadar, bukan diam-diam."
+  ],
+  "run_id": "parity-run",
+  "_catatan_negasi": [
+    "Penghitung kata tidak memahami negasi: kalimat 'tidak ada agenda regulator'",
+    "tetap menaikkan skor risiko karena kata 'regulator' muncul. Kedua implementasi",
+    "(Python dan JavaScript) berperilaku sama, jadi paritas tetap terjaga.",
+    "Konsekuensinya SATU ARAH dan aman: risiko terbaca lebih tinggi daripada",
+    "seharusnya, yang berarti bot lebih sering menahan diri -- bukan lebih sering",
+    "masuk. Jangan 'memperbaiki' ini dengan menghapus kata kunci."
+  ],
+  "verdict_ts": "2026-09-13T08:00:00Z",
+  "cases": [
+    {
+      "name": "verdict sehat, netral, risiko rendah",
+      "verdict": {
+        "prediction": "Tidak ada pemicu besar terdeteksi; pasar cenderung stabil dan bergerak dalam rentang normal.",
+        "confidence": 0.71,
+        "key_dynamics": ["Volume normal", "Perdagangan berjalan tenang tanpa gangguan"],
+        "signals": ["Sentimen sosial netral"]
+      },
+      "expect": { "schema_ok": true, "bias": "NEUTRAL", "event_risk": "LOW", "confidence": 0.71 }
+    },
+    {
+      "name": "verdict tanpa confidence harus ditolak, bukan dibaca sebagai nol",
+      "verdict": {
+        "prediction": "Pasar diperkirakan bergerak normal tanpa pemicu besar dalam horizon ini.",
+        "key_dynamics": ["Volume normal"],
+        "signals": []
+      },
+      "expect": { "schema_ok": false, "bias": "NEUTRAL", "event_risk": "HIGH", "confidence": null }
+    },
+    {
+      "name": "confidence di luar rentang 0..1 ditolak",
+      "verdict": {
+        "prediction": "Pasar diperkirakan bergerak normal tanpa pemicu besar dalam horizon ini.",
+        "confidence": 1.7,
+        "key_dynamics": [],
+        "signals": []
+      },
+      "expect": { "schema_ok": false, "event_risk": "HIGH", "confidence": null }
+    },
+    {
+      "name": "prediction terlalu pendek ditolak",
+      "verdict": { "prediction": "Naik.", "confidence": 0.9, "key_dynamics": [], "signals": [] },
+      "expect": { "schema_ok": false, "event_risk": "HIGH" }
+    },
+    {
+      "name": "verdict kosong ditolak",
+      "verdict": {},
+      "expect": { "schema_ok": false, "event_risk": "HIGH" }
+    },
+    {
+      "name": "verdict null ditolak",
+      "verdict": null,
+      "expect": { "schema_ok": false, "event_risk": "HIGH" }
+    },
+    {
+      "name": "kata risiko tinggi -> HIGH",
+      "verdict": {
+        "prediction": "Terdapat laporan hack pada jembatan lintas rantai yang memicu kepanikan pasar luas.",
+        "confidence": 0.62,
+        "key_dynamics": ["Eksploitasi kontrak jembatan"],
+        "signals": ["Arus keluar bursa meningkat"]
+      },
+      "expect": { "schema_ok": true, "bias": "NEUTRAL", "event_risk": "HIGH" }
+    },
+    {
+      "name": "dua arah sekaligus -> NEUTRAL, tidak menebak",
+      "verdict": {
+        "prediction": "Sinyal campuran: ada tekanan bullish dari arus masuk ETF namun risiko bearish dari likuidasi beruntun.",
+        "confidence": 0.55,
+        "key_dynamics": ["Arus masuk ETF spot"],
+        "signals": ["Rally tertahan", "Potensi selloff"]
+      },
+      "expect": { "schema_ok": true, "bias": "NEUTRAL" }
+    },
+    {
+      "name": "bullish jelas -> LONG",
+      "verdict": {
+        "prediction": "Struktur pasar bullish: rally berlanjut dan uptrend tetap utuh setelah breakout level kunci.",
+        "confidence": 0.8,
+        "key_dynamics": ["Breakout resistencia"],
+        "signals": ["Rally", "Uptrend"]
+      },
+      "expect": { "schema_ok": true, "bias": "LONG" }
+    },
+    {
+      "name": "bearish jelas -> SHORT",
+      "verdict": {
+        "prediction": "Struktur pasar bearish: downtrend berlanjut disertai tekanan jual dan risiko selloff lanjutan.",
+        "confidence": 0.77,
+        "key_dynamics": ["Tekanan jual"],
+        "signals": ["Downtrend", "Selloff"]
+      },
+      "expect": { "schema_ok": true, "bias": "SHORT" }
+    },
+    {
+      "name": "confidence tepat di ambang 0.60 diterima",
+      "verdict": {
+        "prediction": "Kondisi pasar tenang dan stabil; tidak ada peristiwa yang teridentifikasi sebagai pemicu.",
+        "confidence": 0.6,
+        "key_dynamics": [],
+        "signals": []
+      },
+      "expect": { "schema_ok": true, "confidence": 0.6, "event_risk": "LOW" }
+    }
+  ]
+}

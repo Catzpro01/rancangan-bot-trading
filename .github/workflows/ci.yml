@@ -48,10 +48,15 @@ jobs:
         run: python -m pytest -q
 
       - name: Test port JavaScript + adapter MiroFish + kode dalam workflow
-        run: node --test tests/test_parity.js tests/test_mirofish_adapter.js tests/test_workflow_code_nodes.js
+        run: >-
+          node --test tests/test_parity.js tests/test_mirofish_adapter.js
+          tests/test_workflow_code_nodes.js tests/test_mirofish_verdict_parity.js
 
       - name: Validasi struktur workflow n8n
         run: python tools/validate_workflows.py
+
+      - name: Validasi kontrak antar-lapisan (runner <-> adapter <-> skema <-> dokumen)
+        run: python tools/validate_mirofish_contract.py
 
       - name: Smoke test simulator Monte Carlo
         run: |

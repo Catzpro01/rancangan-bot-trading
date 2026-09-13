@@ -93,8 +93,54 @@ melainkan likuidasi tidak pernah fatal.**
 | 4. Statistik | ada track record, EV > 0, `avg_loss ≤ jarak stop`, `avg_win ≤ jarak TP` | `NO_TRACK_RECORD`, `NEGATIVE_EV`, `STATS_INCONSISTENT` |
 | 5. Kapasitas | posisi terbuka < maks, circuit breaker tidak trip, qty & notional ≥ minimum bursa, leverage efektif tidak jebol | `MAX_OPEN_POSITIONS`, `CIRCUIT_BREAKER_TRIPPED`, `SIZE_ZERO`, `BELOW_MIN_SIZE`, `BELOW_MIN_NOTIONAL`, `EFFECTIVE_LEVERAGE_BREACH` |
 
-Plus **peringatan** yang tidak memblokir tetapi wajib masuk log:
+Baris 0 (sebelum gerbang 1): arah sinyal harus LONG atau SHORT — `DIRECTION_NONE`.
+
+### 4.1 Daftar lengkap kode alasan
+
+Tabel ini adalah **kontrak**. `tools/validate_mirofish_contract.py` membandingkannya
+dengan string yang benar-benar dihasilkan `risk_engine.py`, `risk_guard.js`,
+`mirofish_adapter.js`, dan Code node di dalam `n8n/workflows/*.json`. Menambah kode
+baru di kode tanpa menambahkannya di sini akan menggagalkan CI — dan sebaliknya,
+daftar usang di dokumen juga menggagalkan CI, karena saat insiden orang akan mencari
+kode yang sudah tidak ada.
+
+**Menolak order (`reasons`)**
+
+| Lapisan | Kode |
+|---|---|
+| Sinyal | `DIRECTION_NONE`, `MISSING_STOP_OR_TP`, `STOP_ON_WRONG_SIDE`, `TP_ON_WRONG_SIDE`, `RR_TOO_LOW`, `SIGNAL_STALE` |
+| MiroFish | `MIROFISH_SCHEMA_INVALID`, `MIROFISH_STALE`, `MIROFISH_LOW_CONFIDENCE`, `MIROFISH_HIGH_EVENT_RISK_VETO`, `MIROFISH_BIAS_CONFLICT` |
+| Likuidasi | `STOP_TOO_FAR`, `LEVERAGE_CONFIG_INVALID`, `EXCHANGE_LIQ_MISSING`, `LIQ_MISMATCH`, `LOCAL_LIQ_TOO_OPTIMISTIC_LONG`, `LOCAL_LIQ_TOO_OPTIMISTIC_SHORT` |
+| Statistik | `NO_TRACK_RECORD`, `NEGATIVE_EV`, `STATS_INCONSISTENT` |
+| Kapasitas & breaker | `MAX_OPEN_POSITIONS`, `CIRCUIT_BREAKER_TRIPPED`, `SIZE_ZERO`, `BELOW_MIN_SIZE`, `BELOW_MIN_NOTIONAL`, `EFFECTIVE_LEVERAGE_BREACH` |
+| Sizing | `EQUITY_OR_ENTRY_INVALID`, `STOP_DISTANCE_INVALID` |
+
+**Tidak memblokir, wajib masuk log (`warnings`)**
+
 `LIQ_DISTANCE_TINY`, `MIROFISH_CONFIDENCE_MARGINAL`, `HIGH_TAKER_FEE`.
+
+**Alasan circuit breaker trip** (`evaluate_breaker()`, disimpan di `bot_state.halt_reason`)
+
+`HALTED` (sudah di-halt manual — tetap halt setelah restart, tidak menyala sendiri),
+`DAILY_LOSS`, `DRAWDOWN`, `CONSEC_LOSSES`, `DAY_START_EQUITY_INVALID`.
+
+**Alasan exit** (monitor 15 detik)
+
+`STOP_LOSS`, `TAKE_PROFIT`, `TIME_STOP`, `ANOMALY:LEVERAGE_<n>`,
+`ANOMALY:NOT_ISOLATED`, `ANOMALY:SYMBOL_NOT_WHITELISTED`, `NOT_ISOLATED`, `SYMBOL_NOT_WHITELISTED`, `LEVERAGE_<n>` — kode ini dirangkai dengan angka leverage yang terbaca dari bursa, misalnya LEVERAGE_20 — beberapa anomali digabung dengan koma dalam satu kode.
+
+**Masalah preflight** (setelan akun tidak cocok → HALT)
+
+`LEVERAGE_MISMATCH`, `MARGIN_MODE`, `POSITION_MODE`, `HEARTBEAT_STALE`,
+`RISK_TABLE_MAX_LEVERAGE`, `RISK_TABLE_MISSING_MMR`.
+
+**Catatan adapter MiroFish** (masuk `mirofish_verdict.raw.notes`)
+
+`VERDICT_MISSING`, `PREDICTION_MISSING_OR_TOO_SHORT`, `CONFIDENCE_MISSING`,
+`CONFIDENCE_OUT_OF_RANGE`, `TIMESTAMP_MISSING`, `UNPARSEABLE_TIMESTAMP`,
+`EVIDENCE_NOT_A_LIST`, `CONFIDENCE_BELOW_GATE`, `RISK_WORD:<kata>`.
+
+**Kill switch**: `MANUAL_KILL`.
 
 ### Contoh keluaran nyata
 

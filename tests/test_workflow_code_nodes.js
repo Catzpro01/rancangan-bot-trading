@@ -248,6 +248,9 @@ test('kill switch menandatangani DELETE allOrders', async () => {
   assert.strictEqual(j.path, '/uapi/v1/trade/allOrders');
   assert.match(j.signature, /^[0-9a-f]{64}$/);
   assert.strictEqual(JSON.parse(j.body).symbol, 'BTC_USDT_PERP');
+  // URL yang dikirim harus memuat timestamp yang SAMA dengan yang ditandatangani.
+  assert.strictEqual(j.url,
+    `https://api.pionex.com/uapi/v1/trade/allOrders?timestamp=${j.timestamp}`);
 });
 
 test('preflight menandai heartbeat basi dan leverage salah', async () => {
@@ -293,4 +296,73 @@ test('breaker di preflight trip pada rugi harian 3%', async () => {
   });
   assert.strictEqual(out[0].json.tripped, true);
   assert.ok(out[0].json.reason.startsWith('DAILY_LOSS'));
+});
+
+test('permintaan baca akun ditandatangani per-permintaan, bukan dari env statis', async () => {
+  const wf = loadWorkflow('01-preflight-watchdog.json');
+  const sign = codeNode(wf, 'Tanda tangan baca akun');
+  assert.ok(!sign.includes('PIONEX_STATIC_READ_SIGNATURE'),
+    'tanda tangan statis tidak boleh ada: kedaluwarsa dalam 20 detik');
+
+  const out = await runNode(sign, {
+    items: [{}], env: { PIONEX_API_SECRET: 'secret-uji', PIONEX_SYMBOL: 'BTC_USDT_PERP' },
+  });
+  const reqs = Array.from(out.map((x) => x.json.req));
+  assert.deepStrictEqual(reqs, ['leverage', 'isolated_mode', 'position_mode', 'balances']);
+
+  for (const { json: j } of out) {
+    assert.match(j.signature, /^[0-9a-f]{64}$/, `${j.req}: tanda tangan harus HMAC-SHA256 hex`);
+    assert.match(j.url, /^https:\/\/api\.pionex\.com\/uapi\/v1\//, j.url);
+    assert.ok(j.url.includes(`timestamp=${j.timestamp}`),
+      `${j.req}: timestamp yang ditandatangani harus sama dengan yang dikirim`);
+    assert.ok(Date.now() - j.timestamp < 60000, 'timestamp harus baru');
+    // query tersortir alfabetis, sesuai spec autentikasi Pionex
+    const qs = Array.from(j.url.split('?')[1].split('&').map((kv) => kv.split('=')[0]));
+    assert.deepStrictEqual(qs, Array.from(qs).sort(), `${j.req}: query harus tersortir`);
+  }
+});
+
+test('tidak ada workflow yang memakai tanda tangan statis atau template rusak', () => {
+  for (const file of fs.readdirSync(WF_DIR).filter((f) => f.endsWith('.json'))) {
+    const raw = fs.readFileSync(path.join(WF_DIR, file), 'utf8');
+    assert.ok(!raw.includes('PIONEX_STATIC_READ_SIGNATURE'), file);
+    assert.ok(!raw.includes('timestamp=='), `${file}: 'timestamp==' adalah typo query`);
+    // '{ $json.x }' (satu kurung kurawal) tidak dievaluasi n8n; '{{ $json.x }}' sah.
+    assert.ok(!/(?<!\{)\{ \$json\./.test(raw),
+      `${file}: '{ $json.x }' satu kurung kurawal tidak dievaluasi n8n`);
+    assert.ok(!/(?<!\{)\{ \$env\./.test(raw),
+      `${file}: '{ $env.x }' satu kurung kurawal tidak dievaluasi n8n`);
+    // URL node HTTP: template n8n di dalamnya harus diapit dua kurung kurawal.
+    const wf = JSON.parse(raw);
+    for (const n of wf.nodes.filter((x) => x.type === 'n8n-nodes-base.httpRequest')) {
+      const url = n.parameters.url || '';
+      assert.ok(!/(?<!\{)\{[^{]*\$json\.[^}]*\}(?!\})/.test(url),
+        `${file} :: ${n.name}: URL memakai template satu kurung kurawal -> ${url}`);
+      assert.ok(!url.includes('=='), `${file} :: ${n.name}: '==' di URL adalah typo query`);
+    }
+  }
+});
+
+test('preflight tetap halt setelah restart bila bot di-halt manual', async () => {
+  const wf = loadWorkflow('01-preflight-watchdog.json');
+  const out = await runNode(codeNode(wf, 'Gabung & hitung breaker'), {
+    items: [{ json: { cfg: CFG, halted: true, halt_reason: 'MANUAL_KILL',
+                      day_start_equity: 1000, equity: 1000,
+                      peak_equity: 1000, consecutive_losses: 0 } }],
+  });
+  assert.strictEqual(out[0].json.tripped, true);
+  assert.ok(out[0].json.reason.startsWith('HALTED'), out[0].json.reason);
+});
+
+test('cek idempotensi ditandatangani dengan clientOrderId yang sama', async () => {
+  const wf = loadWorkflow('03-trading-loop.json');
+  const out = await runNode(codeNode(wf, 'Tanda tangan cek idempotensi'), {
+    items: [{ json: { clientOrderId: 'pg-ENTRY-0123456789abcdef01234567',
+                      signal: { id: 'sig-1' } } }],
+    env: { PIONEX_API_SECRET: 's', PIONEX_SYMBOL: 'BTC_USDT_PERP' },
+  });
+  const j = out[0].json;
+  assert.match(j.signature, /^[0-9a-f]{64}$/);
+  assert.ok(j.url.includes('clientOrderId=pg-ENTRY-0123456789abcdef01234567'), j.url);
+  assert.ok(j.url.includes('symbol=BTC_USDT_PERP'), j.url);
 });
