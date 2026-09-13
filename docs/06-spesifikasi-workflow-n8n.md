@@ -133,7 +133,7 @@ atau tanpa timestamp menghasilkan `schema_ok: false` dan `event_risk: "HIGH"` �
 menahan diri, bukan menebak. Amplop itu ditulis ke `mirofish_verdict` dengan
 `ON CONFLICT (run_id) DO NOTHING`, dan `03-trading-loop` membaca baris terbarunya.
 
-## 7. `07-market-research-cache` — 27 node, tiap 15 menit
+## 7. `07-market-research-cache` — 29 node, tiap 15 menit
 
 Mengumpulkan intelijen pasar dan menyimpannya sebagai satu dokumen di cache KV (Redis).
 Seluruhnya node asli n8n: `HTTP Request`, `Aggregate`, `Limit`, `Edit Fields`, `Merge`,
