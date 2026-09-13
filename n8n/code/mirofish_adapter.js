@@ -181,7 +181,6 @@ function toEnvelope(raw) {
     evidence: (verdict.key_dynamics || verdict.signals || []).slice(0, 10),
     adapter_version: ADAPTER_VERSION,
     notes: notes.concat(risk.hits.map((h) => `RISK_WORD:${h}`)),
-    risk_score: risk.score,
   };
 }
 
