@@ -168,3 +168,28 @@ menghasilkan envelope yang sama (`schema_ok`, `bias`, `confidence`, `event_risk`
 `verdict_ts`) bisa menempati posisi itu — kalender ekonomi sederhana, feed berita dengan
 klasifikasi kata kunci, atau bahkan sumber manual. Yang tidak boleh berubah adalah
 kontrak envelope dan aturan "gagal = veto".
+
+---
+
+## Catatan: dua jalur yang tersedia
+
+Rancangan ini sekarang menyediakan **dua** cara mengisi `mirofish_verdict`, dan keduanya
+boleh dipakai bergantian karena bentuk keluarannya sama:
+
+| | Jalur A — MiroFish asli | Jalur B — simulasi agen di n8n |
+|---|---|---|
+| Workflow | `06-mirofish-sweep` | `07` + `08` (+ `09` penjaga cache) |
+| Mesin | CLI MiroFish (OASIS/CAMEL-AI) lewat `mirofish_runner` | HTTP Request ke LLM, seluruhnya di n8n |
+| Komponen tambahan | satu layanan Python + dependensi berat | tidak ada |
+| Sumber informasi | dokumen/berkas yang Anda unggah | cache pasar: GDELT, Fear & Greed, stablecoin, funding |
+| Status | opsional | **default** |
+
+Yang **tidak berubah** di kedua jalur: peran MiroFish tetap **veto**, adapter tetap
+berlaku "gagal = veto", dan tabel `mirofish_verdict` tetap sama. Lihat
+`docs/11-sumber-data-pasar.md` untuk sumber data jalur B beserta bukti verifikasinya.
+
+Jujur soal jalur B: ia **terinspirasi** MiroFish (banyak agen, peran berbeda, beberapa
+sudut pandang, satu kesimpulan), tetapi bukan MiroFish. Ia tidak memakai OASIS, tidak
+membangun graf sosial, dan tidak mensimulasikan penyebaran informasi antar-agen. Yang
+ia lakukan adalah meminta lima peran berbeda menilai data yang sama lalu menyimpulkan —
+struktur yang sama, mekanisme yang jauh lebih sederhana.

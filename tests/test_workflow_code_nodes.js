@@ -26,7 +26,18 @@ function codeNode(wf, name) {
 // Menjalankan kode seperti n8n: di dalam fungsi dengan items/$env/$json, dan dengan
 // `require` tersedia (Code node n8n adalah modul CommonJS). `new Function` tidak
 // menyediakan require, jadi dipakai vm dengan sandbox berisi require.
-async function runNode(code, { items = [], env = {}, json = {} } = {}) {
+// Meniru n8n: di Code node, `$json` merujuk ke json item masukan PERTAMA.
+// Harness ini dulu mengirim {} kosong, sehingga node yang membaca $json terlihat
+// rusak padahal di n8n benar. `json` tetap bisa ditimpa eksplisit untuk menguji
+// jalur tertentu.
+//
+// CATATAN JUJUR: semantik $json ini belum saya verifikasi dengan menjalankan n8n
+// sungguhan. Karena itu node-node baru tetap membaca `items[0].json` secara
+// eksplisit, yang benar di kedua tafsir.
+async function runNode(code, { items = [], env = {}, json } = {}) {
+  const effectiveJson = json !== undefined
+    ? json
+    : ((items[0] && items[0].json) || {});
   const sandboxModule = { exports: {} };
   const sandbox = {
     require: (id) => require(id),
@@ -37,7 +48,7 @@ async function runNode(code, { items = [], env = {}, json = {} } = {}) {
   vm.createContext(sandbox);
   const src = `(async function (items, $env, $json) {\n${code}\n})`;
   const factory = vm.runInContext(src, sandbox);
-  return factory(items, env, json);
+  return factory(items, env, effectiveJson);
 }
 
 const CFG = JSON.parse(
@@ -497,4 +508,141 @@ test('monitor menggabungkan posisi bursa dengan state DB per posisi', async () =
   assert.strictEqual(b.reason, 'ANOMALY:STOP_UNKNOWN',
     'posisi tanpa state tidak boleh dibiarkan tanpa stop');
   assert.strictEqual(b.exit, true);
+});
+
+// ---------------------------------------------------------------------------
+// Workflow 07/08/09: riset pasar -> cache KV -> simulasi agen -> verdict
+// ---------------------------------------------------------------------------
+
+test('workflow 07 memakai node asli n8n saja, tanpa Code node', () => {
+  const wf = loadWorkflow('07-market-research-cache.json');
+  const jenis = {};
+  for (const n of wf.nodes) jenis[n.type] = (jenis[n.type] || 0) + 1;
+  assert.strictEqual(jenis['n8n-nodes-base.code'], undefined,
+    'workflow riset tidak boleh punya Code node');
+  assert.ok(jenis['n8n-nodes-base.redis'] >= 7, 'harus menulis tiap sumber ke cache');
+  assert.ok(jenis['n8n-nodes-base.merge'] >= 1, 'butuh Merge untuk menggabungkan cabang');
+  assert.ok(jenis['n8n-nodes-base.set'] >= 6, 'tiap cabang harus menamai field-nya');
+});
+
+test('workflow 07 menulis ke kunci cache yang dibaca workflow 08', () => {
+  const wf07 = loadWorkflow('07-market-research-cache.json');
+  const ditulis = wf07.nodes
+    .filter((n) => n.type === 'n8n-nodes-base.redis')
+    .map((n) => n.parameters.key);
+  assert.ok(ditulis.includes('pg:research:latest'), ditulis.join(', '));
+
+  const wf08 = loadWorkflow('08-market-intel-simulation.json');
+  const dibaca = wf08.nodes
+    .filter((n) => n.type === 'n8n-nodes-base.redis')
+    .map((n) => n.parameters.key);
+  assert.ok(dibaca.includes('pg:research:latest'),
+    'workflow simulasi harus membaca kunci yang sama');
+});
+
+test('sumber data workflow 07 adalah endpoint yang terverifikasi', () => {
+  const wf = loadWorkflow('07-market-research-cache.json');
+  const urls = wf.nodes
+    .filter((n) => n.type === 'n8n-nodes-base.httpRequest')
+    .map((n) => n.parameters.url);
+  const wajib = ['api.gdeltproject.org', 'api.alternative.me', 'stablecoins.llama.fi'];
+  for (const w of wajib) {
+    assert.ok(urls.some((u) => u.includes(w)), `endpoint ${w} tidak dipakai`);
+  }
+});
+
+test('workflow 09 tidak memakai Code node', () => {
+  const wf = loadWorkflow('09-cache-watchdog.json');
+  assert.ok(!wf.nodes.some((n) => n.type === 'n8n-nodes-base.code'));
+});
+
+test('pembangun panggilan agen menghasilkan satu item per peran', async () => {
+  const wf = loadWorkflow('08-market-intel-simulation.json');
+  const out = await runNode(codeNode(wf, 'Bangun panggilan agen'), {
+    env: { LLM_MODEL: 'model-uji', PIONEX_SYMBOL: 'BTC_USDT_PERP' },
+    items: [{ json: { cache: {
+      symbol: 'BTC_USDT_PERP', collected_at: NOW_ISO(),
+      fear_greed: [{ value: '61', value_classification: 'Greed' }],
+      negative: [{ title: 'Exchange X hack' }],
+      stablecoin: [{ totalCirculatingUSD: 183000000000 }],
+    } } }],
+  });
+
+  assert.strictEqual(out.length, 5, 'lima peran agen');
+  const peran = Array.from(out.map((x) => x.json.agent));
+  assert.ok(peran.includes('risiko_ekstrem') && peran.includes('kontrarian'), peran);
+
+  for (const { json: j } of out) {
+    const body = JSON.parse(j.body);
+    assert.strictEqual(body.model, 'model-uji');
+    assert.deepStrictEqual(body.response_format, { type: 'json_object' });
+    assert.strictEqual(body.messages.length, 2);
+    // konteks cache harus benar-benar masuk ke prompt, bukan prompt kosong
+    assert.ok(body.messages[1].content.includes('Exchange X hack'),
+      `${j.agent}: berita dari cache tidak masuk ke prompt`);
+    assert.ok(body.messages[0].content.includes('JSON'),
+      `${j.agent}: prompt harus menuntut keluaran JSON`);
+  }
+});
+
+test('cache kosong tetap menghasilkan panggilan yang sah (bukan crash)', async () => {
+  const wf = loadWorkflow('08-market-intel-simulation.json');
+  const out = await runNode(codeNode(wf, 'Bangun panggilan agen'), {
+    env: { PIONEX_SYMBOL: 'BTC_USDT_PERP' },
+    items: [{ json: {} }],
+  });
+  assert.strictEqual(out.length, 5);
+  for (const { json: j } of out) {
+    const body = JSON.parse(j.body);
+    assert.strictEqual(typeof body.messages[1].content, 'string');
+  }
+});
+
+test('penyintesis menandai agen yang tidak mengembalikan JSON sah', async () => {
+  const wf = loadWorkflow('08-market-intel-simulation.json');
+  const out = await runNode(codeNode(wf, 'Simpulkan pendapat agen'), {
+    env: { LLM_MODEL: 'm' },
+    items: [
+      { json: { agent: 'makro', choices: [{ message: {
+        content: '{"stance":"NEUTRAL","confidence":0.4,"event_risk":"LOW","alasan":"x","bukti":[]}' } }] } },
+      { json: { agent: 'kontrarian', choices: [{ message: { content: 'Saya rasa pasar akan naik.' } }] } },
+      { json: { agent: 'arus_modal' } },
+    ],
+  });
+  assert.strictEqual(out.length, 1);
+  assert.strictEqual(out[0].json.jumlah_agen, 3);
+  assert.strictEqual(out[0].json.agen_gagal, 2, 'satu teks bebas + satu tanpa respons');
+  // body adalah string JSON di dalam JSON, jadi tanda kutipnya ter-escape
+  assert.ok(JSON.parse(out[0].json.body).messages[1].content.includes('"agen_gagal":2'),
+    'jumlah agen gagal harus ikut terkirim ke LLM sintesis');
+});
+
+test('pembungkus verdict menghasilkan bentuk yang diminta adapter', async () => {
+  const wf = loadWorkflow('08-market-intel-simulation.json');
+  const baik = { choices: [{ message: { content: JSON.stringify({
+    prediction: 'Tidak ada pemicu besar; pasar cenderung stabil dalam rentang normal hari ini.',
+    confidence: 0.62, event_risk: 'LOW', key_dynamics: ['Volume normal'], signals: [],
+  }) } }] };
+
+  const out = await runNode(codeNode(wf, 'Bungkus jadi verdict'), { items: [{ json: baik }] });
+  const j = out[0].json;
+  for (const k of ['run_id', 'job_id', 'job_status', 'created_at', 'verdict',
+                   'summary', 'manifest']) {
+    assert.ok(k in j, `kunci ${k} hilang`);
+  }
+  assert.strictEqual(j.verdict.confidence, 0.62);
+  assert.strictEqual(j.manifest.run_id, j.run_id);
+
+  // LLM membalas bukan JSON -> verdict null -> adapter akan memveto
+  const rusak = await runNode(codeNode(wf, 'Bungkus jadi verdict'), {
+    items: [{ json: { choices: [{ message: { content: 'maaf saya tidak bisa' } }] } }],
+  });
+  assert.strictEqual(rusak[0].json.verdict, null);
+
+  // dan adapter benar-benar memveto keduanya dengan benar
+  const env = await runNode(codeNode(wf, 'Adapter verdict'), {
+    items: [{ json: { ...rusak[0].json } }],
+  });
+  assert.strictEqual(env[0].json.schema_ok, false);
+  assert.strictEqual(env[0].json.event_risk, 'HIGH');
 });

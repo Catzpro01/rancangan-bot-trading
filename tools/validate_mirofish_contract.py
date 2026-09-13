@@ -307,6 +307,46 @@ def check_risk_weights_parity() -> None:
     ok(f"bobot risiko: {len(py)} kata kunci identik di Python dan JavaScript")
 
 
+def check_simulation_contract() -> None:
+    """Workflow 07/08/09: kunci cache, bentuk verdict, dan jumlah Code node."""
+    wf_dir = ROOT / "n8n/workflows"
+
+    # a) kunci cache yang ditulis 07 harus yang dibaca 08
+    def redis_keys(fname: str) -> set[str]:
+        wf = json.loads((wf_dir / fname).read_text(encoding="utf-8"))
+        return {n["parameters"].get("key", "")
+                for n in wf["nodes"] if n["type"] == "n8n-nodes-base.redis"}
+
+    written = redis_keys("07-market-research-cache.json")
+    read = redis_keys("08-market-intel-simulation.json") | redis_keys("09-cache-watchdog.json")
+    if "pg:research:latest" not in written:
+        fail("workflow 07 tidak menulis pg:research:latest")
+    if not (read - written):
+        ok(f"cache KV: {len(written)} kunci ditulis 07, semuanya dibaca ulang")
+    else:
+        fail(f"workflow 08/09 membaca kunci yang tidak pernah ditulis: {sorted(read - written)}")
+
+    # b) workflow riset & penjaga cache tidak boleh punya Code node
+    for fname in ("07-market-research-cache.json", "09-cache-watchdog.json"):
+        wf = json.loads((wf_dir / fname).read_text(encoding="utf-8"))
+        codes = [n["name"] for n in wf["nodes"] if n["type"] == "n8n-nodes-base.code"]
+        if codes:
+            fail(f"{fname} masih punya Code node: {codes}")
+    ok("workflow 07 dan 09 memakai node asli n8n saja (nol Code node)")
+
+    # c) pembungkus verdict harus mengirim kunci yang dibaca adapter
+    wf = json.loads((wf_dir / "08-market-intel-simulation.json").read_text(encoding="utf-8"))
+    wrap = next((n for n in wf["nodes"] if n["name"] == "Bungkus jadi verdict"), None)
+    if wrap is None:
+        fail("workflow 08 tidak punya node 'Bungkus jadi verdict'")
+        return
+    js = wrap["parameters"]["jsCode"]
+    for key in ("run_id", "verdict", "manifest", "created_at", "job_status"):
+        if f"{key}:" not in js:
+            fail(f"pembungkus verdict tidak mengirim `{key}` yang dibaca adapter")
+    ok("pembungkus verdict mengirim bentuk yang dibaca adapter")
+
+
 def check_env_documented() -> None:
     env_file = ROOT / "deploy/.env.example"
     if not env_file.is_file():
@@ -326,7 +366,8 @@ def check_env_documented() -> None:
         "N8N_ENCRYPTION_KEY", "GENERIC_TIMEZONE", "MIROFISH_BIN",
         "MIROFISH_ARTIFACTS", "MIROFISH_TIMEOUT_SEC", "MIROFISH_MAX_ROUNDS",
         "MIROFISH_PLATFORM", "MIROFISH_FAKE", "MIROFISH_CWD", "MIROFISH_RUNNER_DATA",
-        "TZ", "PIONEX_BASE_URL",
+        "TZ", "PIONEX_BASE_URL", "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD",
+        "LLM_MAX_CALLS_PER_DAY",
     }
     if unused:
         fail(f".env.example mendefinisikan variabel yang tidak dipakai siapa pun: {sorted(unused)}")
@@ -360,6 +401,7 @@ def main() -> int:
         check_workflows_against_schema,
         check_reason_codes_documented,
         check_risk_weights_parity,
+        check_simulation_contract,
         check_env_documented,
         check_endpoints_documented,
     ):

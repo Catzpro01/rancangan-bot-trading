@@ -23,16 +23,17 @@ diatur oleh **n8n**, dengan **MiroFish** sebagai lapisan penilaian risiko perist
 | `docs/08` | Rencana rollout & validasi (paper → live bertahap) |
 | `docs/09` | Runbook insiden + kill switch |
 | `docs/10` | Checklist pra-live |
+| `docs/11` | **Sumber data pasar**: yang terverifikasi, batasannya, dan yang menyesatkan |
 | `risk_engine/` | Kernel risiko (Python, tanpa dependensi) — sumber kebenaran |
 | `n8n/code/` | Kembaran JavaScript kernel + adapter verdict MiroFish |
-| `n8n/workflows/` | 6 workflow siap impor (dihasilkan, jangan disunting) |
+| `n8n/workflows/` | 9 workflow siap impor (dihasilkan, jangan disunting) |
 | `mirofish_runner/` | Layanan HTTP yang membungkus CLI MiroFish |
 | `simulator/` | Monte Carlo untuk menguji rencana sebelum uang dipakai |
 | `config/` | `risk_config.json` — satu-satunya tempat angka risiko diubah |
 | `db/schema.sql` | Skema Postgres untuk state + audit trail |
 | `deploy/` | `docker-compose.yml`, Dockerfile runner, `.env.example` |
 | `tools/` | Generator workflow + 3 validator |
-| `tests/` | 122 test Python + 63 test Node (10 + 13 + 24 + 16) |
+| `tests/` | 122 test Python + 71 test Node (10 + 13 + 32 + 16) |
 
 ## Mulai dari sini
 
@@ -87,8 +88,8 @@ dalam workflow tidak bisa tertinggal versi.
 | Runner MiroFish: job, artefak, kontrak respons | `tests/test_mirofish_runner.py` | 29 passed |
 | Lapisan HTTP runner: auth, kode status, bentuk respons | `tests/test_mirofish_runner_app.py` | 15 passed |
 | Node multi-input menggabungkan cabang dengan benar | `tests/test_workflow_code_nodes.js` | 24/24 |
-| Struktur JSON workflow n8n | `tools/validate_workflows.py` | 6 workflow valid |
-| Kontrak antar-lapisan | `tools/validate_mirofish_contract.py` | 7 pemeriksaan |
+| Struktur JSON workflow n8n | `tools/validate_workflows.py` | 9 workflow valid |
+| Kontrak antar-lapisan | `tools/validate_mirofish_contract.py` | 10 pemeriksaan |
 | Berkas deployment | `tools/validate_deploy.py` | 6 pemeriksaan |
 | Konsistensi `liquidation_price()` ↔ `liquidation_distance_pct()` | test identitas di 5 tingkat leverage | identik (< 1e-9) |
 | `config/risk_config.json` cocok dengan field `RiskConfig` | `TestConfigFile` | cocok, tanpa kunci liar |

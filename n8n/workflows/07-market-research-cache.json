@@ -1,0 +1,885 @@
+{
+  "name": "Pionex Guard \u2014 07 Riset Pasar & Cache",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "52a9d870-7c9a-6f92-123b-2a1e52cd7da2",
+      "name": "Setiap 15 menit",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -900,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.gdeltproject.org/api/v2/doc/doc?query=%22bitcoin%22%20OR%20%22crypto%22&mode=TimelineTone&format=json&timespan=7d",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "68e22b70-2fa4-cebe-ead1-e30067ee770f",
+      "name": "GDELT nada berita",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -900,
+        -300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "set-0",
+              "name": "tone",
+              "value": "={{ $json }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Beri nama: tone",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -700,
+        -300
+      ],
+      "id": "4f604acd-7a21-d8aa-5b46-a2dee3b9f80b"
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "pg:research:tone",
+        "value": "={{ JSON.stringify($json.tone) }}",
+        "keyType": "automatic",
+        "options": {
+          "expire": true,
+          "ttl": 3600
+        }
+      },
+      "name": "Cache nada berita",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        -500,
+        -300
+      ],
+      "credentials": {
+        "redis": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Redis"
+        }
+      },
+      "id": "3c5a8366-1f7d-3b1b-5dbd-95ca2857e0c9"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.gdeltproject.org/api/v2/doc/doc?query=%22bitcoin%22%20OR%20%22crypto%22&mode=TimelineVol&format=json&timespan=7d",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "715b2d80-c152-0af9-8883-2c268832d0f4",
+      "name": "GDELT volume berita",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -900,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "set-0",
+              "name": "volume",
+              "value": "={{ $json }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Beri nama: volume",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -700,
+        -180
+      ],
+      "id": "79b81072-acb6-d57e-a958-19766a2ddbc0"
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "pg:research:volume",
+        "value": "={{ JSON.stringify($json.volume) }}",
+        "keyType": "automatic",
+        "options": {
+          "expire": true,
+          "ttl": 3600
+        }
+      },
+      "name": "Cache volume berita",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        -500,
+        -180
+      ],
+      "credentials": {
+        "redis": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Redis"
+        }
+      },
+      "id": "fea243e0-f196-f446-5bc9-a0ff5ac0b268"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.gdeltproject.org/api/v2/doc/doc?query=bitcoin%20tone%3C-5&mode=ArtList&format=json&maxrecords=25&sort=DateDesc&timespan=2d",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "f1103ad9-0843-80a8-9811-0574e6bc61b6",
+      "name": "GDELT berita negatif",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -900,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "maxItems": 15
+      },
+      "name": "Batasi 15 berita",
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        -60
+      ],
+      "id": "5dad1ee2-0cc0-3c11-5cd8-49eb79a80dec"
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "set-0",
+              "name": "negative",
+              "value": "={{ $json.articles || [] }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Beri nama: negative",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        -60
+      ],
+      "id": "8e43849b-dee2-e8ff-2e6d-62079262cab2"
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "pg:research:negative",
+        "value": "={{ JSON.stringify($json.negative) }}",
+        "keyType": "automatic",
+        "options": {
+          "expire": true,
+          "ttl": 3600
+        }
+      },
+      "name": "Cache berita negatif",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        -360,
+        -60
+      ],
+      "credentials": {
+        "redis": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Redis"
+        }
+      },
+      "id": "547d74bd-356c-b88f-86d3-4f3aede59d99"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.alternative.me/fng/?limit=14",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "4c7b3602-fe70-0533-2ef5-7284baee7b8c",
+      "name": "Fear & Greed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -900,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "set-0",
+              "name": "fear_greed",
+              "value": "={{ $json.data || [] }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Beri nama: fear_greed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -700,
+        60
+      ],
+      "id": "c90543c6-f305-b5cb-12a5-e292fd47d94b"
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "pg:research:fear_greed",
+        "value": "={{ JSON.stringify($json.fear_greed) }}",
+        "keyType": "automatic",
+        "options": {
+          "expire": true,
+          "ttl": 3600
+        }
+      },
+      "name": "Cache fear greed",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        -500,
+        60
+      ],
+      "credentials": {
+        "redis": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Redis"
+        }
+      },
+      "id": "121ada42-5c06-28ca-82d4-d07ad3c84c51"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://stablecoins.llama.fi/stablecoincharts/all?stablecoin=1",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "eb2e1cb2-32d5-055c-00a7-c164a6463da3",
+      "name": "Aliran stablecoin",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -900,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "options": {},
+        "outputField": "series"
+      },
+      "name": "Rangkai deret stablecoin",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        180
+      ],
+      "id": "d579c694-1f54-a73b-65ef-1f803d472021"
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "set-0",
+              "name": "stablecoin",
+              "value": "={{ ($json.series || []).slice(-30) }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Ambil 30 hari terakhir",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        180
+      ],
+      "id": "6919c6eb-9008-2192-23ce-a39f9d796996"
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "pg:research:stablecoin",
+        "value": "={{ JSON.stringify($json.stablecoin) }}",
+        "keyType": "automatic",
+        "options": {
+          "expire": true,
+          "ttl": 3600
+        }
+      },
+      "name": "Cache aliran stablecoin",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        -360,
+        180
+      ],
+      "credentials": {
+        "redis": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Redis"
+        }
+      },
+      "id": "11ec6f8f-6205-f9d8-dc4a-89fddda9740c"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.pionex.com/api/v1/market/indexes?symbol={{ $env.PIONEX_SYMBOL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "1a5efcbc-e490-ba31-a994-42d71a512bba",
+      "name": "Funding & indeks",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "set-0",
+              "name": "funding",
+              "value": "={{ $json }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Beri nama: funding",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -700,
+        300
+      ],
+      "id": "e97752ba-5511-6d05-f0dc-b4f45b1ef8c8"
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "pg:research:funding",
+        "value": "={{ JSON.stringify($json.funding) }}",
+        "keyType": "automatic",
+        "options": {
+          "expire": true,
+          "ttl": 900
+        }
+      },
+      "name": "Cache funding",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        -500,
+        300
+      ],
+      "credentials": {
+        "redis": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Redis"
+        }
+      },
+      "id": "f34df941-24a9-8c58-fb67-c2593554696d"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "options": {},
+        "combineBy": "combineByPosition"
+      },
+      "name": "Gabung semua sumber",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        0,
+        0
+      ],
+      "id": "74962f3e-ab16-4c85-4562-a968f19f99d4"
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "set-0",
+              "name": "symbol",
+              "value": "={{ $env.PIONEX_SYMBOL }}",
+              "type": "string"
+            },
+            {
+              "id": "set-1",
+              "name": "collected_at",
+              "value": "={{ new Date().toISOString() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Dokumen riset",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        0
+      ],
+      "id": "021e14f4-221a-be9c-7df4-526b62ce497d"
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "pg:research:latest",
+        "value": "={{ JSON.stringify($json) }}",
+        "keyType": "automatic",
+        "options": {
+          "expire": true,
+          "ttl": 7200
+        }
+      },
+      "name": "Cache induk (kv)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        440,
+        0
+      ],
+      "credentials": {
+        "redis": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Redis"
+        }
+      },
+      "id": "d534c6f1-d1d2-8a8f-b9cb-b515cbcd188a"
+    }
+  ],
+  "connections": {
+    "Setiap 15 menit": {
+      "main": [
+        [
+          {
+            "node": "GDELT nada berita",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "GDELT volume berita",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "GDELT berita negatif",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fear & Greed",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Aliran stablecoin",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Funding & indeks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GDELT nada berita": {
+      "main": [
+        [
+          {
+            "node": "Beri nama: tone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Beri nama: tone": {
+      "main": [
+        [
+          {
+            "node": "Cache nada berita",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GDELT volume berita": {
+      "main": [
+        [
+          {
+            "node": "Beri nama: volume",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Beri nama: volume": {
+      "main": [
+        [
+          {
+            "node": "Cache volume berita",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GDELT berita negatif": {
+      "main": [
+        [
+          {
+            "node": "Batasi 15 berita",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batasi 15 berita": {
+      "main": [
+        [
+          {
+            "node": "Beri nama: negative",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Beri nama: negative": {
+      "main": [
+        [
+          {
+            "node": "Cache berita negatif",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fear & Greed": {
+      "main": [
+        [
+          {
+            "node": "Beri nama: fear_greed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Beri nama: fear_greed": {
+      "main": [
+        [
+          {
+            "node": "Cache fear greed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aliran stablecoin": {
+      "main": [
+        [
+          {
+            "node": "Rangkai deret stablecoin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rangkai deret stablecoin": {
+      "main": [
+        [
+          {
+            "node": "Ambil 30 hari terakhir",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ambil 30 hari terakhir": {
+      "main": [
+        [
+          {
+            "node": "Cache aliran stablecoin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Funding & indeks": {
+      "main": [
+        [
+          {
+            "node": "Beri nama: funding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Beri nama: funding": {
+      "main": [
+        [
+          {
+            "node": "Cache funding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache nada berita": {
+      "main": [
+        [
+          {
+            "node": "Gabung semua sumber",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache volume berita": {
+      "main": [
+        [
+          {
+            "node": "Gabung semua sumber",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache berita negatif": {
+      "main": [
+        [
+          {
+            "node": "Gabung semua sumber",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache fear greed": {
+      "main": [
+        [
+          {
+            "node": "Gabung semua sumber",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache aliran stablecoin": {
+      "main": [
+        [
+          {
+            "node": "Gabung semua sumber",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache funding": {
+      "main": [
+        [
+          {
+            "node": "Gabung semua sumber",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gabung semua sumber": {
+      "main": [
+        [
+          {
+            "node": "Dokumen riset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dokumen riset": {
+      "main": [
+        [
+          {
+            "node": "Cache induk (kv)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveExecutionProgress": true
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "pionex-guard-50x"
+    }
+  ]
+}

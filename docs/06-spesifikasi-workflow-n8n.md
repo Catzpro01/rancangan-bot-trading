@@ -1,6 +1,6 @@
 # 06 — Spesifikasi Workflow n8n
 
-Enam workflow di `n8n/workflows/`. **Jangan disunting langsung** — semuanya dihasilkan
+Sembilan workflow di `n8n/workflows/`. **Jangan disunting langsung** — semuanya dihasilkan
 oleh `tools/make_n8n_workflows.py`. Ubah generatornya, jalankan
 `python tools/make_n8n_workflows.py`, lalu commit hasilnya. CI menggagalkan build bila
 berkas di repo tidak lagi cocok dengan keluaran generator, jadi salinan kode guard di
@@ -114,7 +114,15 @@ Urutannya penting: **batalkan order dulu, baru ratakan posisi.** Kalau dibalik, 
 limit yang masih aktif bisa terisi setelah posisi diratakan dan membuka posisi baru
 tanpa pengawasan.
 
-## 6. `06-mirofish-sweep` — 12 node, 4 jam + poll 2 menit
+## 6. `06-mirofish-sweep` — 12 node, 4 jam + poll 2 menit — **OPSIONAL**
+
+Ini jalur **MiroFish asli** (CLI Python, lewat `mirofish_runner`). Pakai ini hanya bila
+Anda memang memasang MiroFish. Bila Anda memakai workflow `07` + `08` (riset pasar +
+simulasi agen di dalam n8n), workflow ini boleh tidak diaktifkan dan layanan
+`mirofish-runner` boleh dimatikan.
+
+Keduanya menulis ke tabel `mirofish_verdict` yang sama dan memakai adapter yang sama,
+jadi gerbang risiko tidak peduli verdictnya datang dari mana.
 
 Dua pemicu terpisah. Yang 4 jam mengirimkan job ke `mirofish_runner`; yang 2 menit
 memeriksa job yang sedang berjalan dan menyimpan verdictnya.
@@ -125,7 +133,77 @@ atau tanpa timestamp menghasilkan `schema_ok: false` dan `event_risk: "HIGH"` �
 menahan diri, bukan menebak. Amplop itu ditulis ke `mirofish_verdict` dengan
 `ON CONFLICT (run_id) DO NOTHING`, dan `03-trading-loop` membaca baris terbarunya.
 
-## 7. Memasukkan ke n8n
+## 7. `07-market-research-cache` — 24 node, tiap 15 menit, **nol Code node**
+
+Mengumpulkan intelijen pasar dan menyimpannya sebagai satu dokumen di cache KV (Redis).
+Seluruhnya node asli n8n: `HTTP Request`, `Aggregate`, `Limit`, `Edit Fields`, `Merge`,
+`Redis`.
+
+Enam cabang berjalan paralel, dan **tiap cabang menyimpan sendiri-sendiri ke Redis**.
+Alasannya: kalau satu sumber mati, lima lainnya tetap tersimpan. Kalau semua ditulis di
+ujung, satu kegagalan akan menggugurkan seluruh dokumen.
+
+| Cabang | Sumber | Kunci cache | TTL |
+|---|---|---|---|
+| Nada berita | GDELT `TimelineTone` | `pg:research:tone` | 1 jam |
+| Volume berita | GDELT `TimelineVol` | `pg:research:volume` | 1 jam |
+| Berita negatif | GDELT `ArtList tone<-5` | `pg:research:negative` | 1 jam |
+| Fear & Greed | alternative.me | `pg:research:fear_greed` | 1 jam |
+| Aliran stablecoin | DefiLlama (30 titik terakhir) | `pg:research:stablecoin` | 1 jam |
+| Funding & indeks | Pionex publik | `pg:research:funding` | 15 menit |
+
+**Urutan node di sini penting.** Tiap cabang melewati `Edit Fields` untuk menamai
+field-nya (`tone`, `volume`, …) *sebelum* masuk `Merge`. Tanpa penamaan itu, `Merge`
+menumpuk enam item terpisah dan dokumen induknya kosong — kegagalan yang tidak
+menimbulkan error, hanya data yang hilang diam-diam.
+
+Semua endpoint di atas gratis dan tanpa kunci API. Rincian, bukti verifikasi, dan
+batasannya ada di `docs/11-sumber-data-pasar.md`.
+
+## 8. `08-market-intel-simulation` — 11 node, tiap 2 jam
+
+Simulasi multi-agen bergaya MiroFish, seluruhnya di dalam n8n.
+
+| # | Node | Jenis | Tugas |
+|---|---|---|---|
+| 1 | Baca cache riset | redis | `pg:research:latest` |
+| 2 | Bangun panggilan agen | code | 5 peran → 5 item, masing-masing dengan prompt sendiri |
+| 3 | LLM paralel (5 agen) | http | satu node, lima panggilan (n8n menjalankan HTTP node sekali per item) |
+| 4 | Simpulkan pendapat agen | code | gabung jawaban + parse JSON + hitung agen yang gagal |
+| 5 | LLM sintesis | http | satu kesimpulan |
+| 6 | Bungkus jadi verdict | code | bentuk `{ verdict, manifest, run_id }` |
+| 7 | Adapter verdict | code | **tidak berubah** dari sebelumnya |
+| 8 | Simpan verdict | postgres | `mirofish_verdict` |
+| 9 | Veto? → Notifikasi | if + email | bila `event_risk = HIGH` |
+
+Lima peran agennya: `makro`, `arus_modal`, `risiko_ekstrem`, `kontrarian`,
+`mikrostruktur`. Peran `kontrarian` diwajibkan berargumen melawan konsensus — tanpa itu,
+lima agen yang membaca data sama hanya akan saling mengiyakan, dan "simulasi" berubah
+menjadi satu opini yang diulang lima kali.
+
+**Yang tidak berubah sama sekali:** node 7 (adapter), tabel `mirofish_verdict`, dan
+gerbang risiko. Node 6 sengaja menghasilkan bentuk respons yang sama persis dengan yang
+dulu dihasilkan `mirofish_runner`, jadi mengganti MiroFish asli dengan simulasi n8n
+tidak menyentuh lapisan keputusan sedikit pun.
+
+**Kenapa empat Code node masih ada di sini** (dan tidak ada node asli penggantinya):
+merangkai lima peran menjadi lima prompt berbeda, mem-parse JSON keluaran LLM, dan
+membentuk ulang respons. Parser JSON-nya memakai pemindaian kedalaman kurung, bukan
+regex — regex sederhana memotong objek valid di kurung kurawal pertama dan membuat
+JSON yang benar terbaca sebagai gagal.
+
+**Biaya:** 6 panggilan LLM per sweep × 12 sweep/hari = **72 panggilan/hari**. Dengan
+model kecil ini murah, tapi tetap pantau. `LLM_MAX_CALLS_PER_DAY` ada di
+`deploy/.env.example` sebagai pengingat untuk memasang batas.
+
+## 9. `09-cache-watchdog` — 5 node, tiap 10 menit, **nol Code node**
+
+`Redis Get` → `Edit Fields` (hitung umur) → `If` (> 1 jam) → email.
+
+Cache yang basi lebih berbahaya daripada cache yang kosong: yang kosong jelas ditolak,
+yang basi terlihat sah. Karena itu umur dokumen induk diawasi terpisah dari TTL Redis.
+
+## 10. Memasukkan ke n8n
 
 1. `docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d`
 2. Buka n8n → **Workflows → Import from File** → pilih berkas JSON.

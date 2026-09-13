@@ -1,0 +1,381 @@
+{
+  "name": "Pionex Guard \u2014 08 Simulasi Agen Pasar",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 2
+            }
+          ]
+        }
+      },
+      "id": "c9d638de-c9c3-7769-ff5d-764ca5888264",
+      "name": "Setiap 2 jam",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -900,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "pg:research:latest",
+        "propertyName": "cache",
+        "keyType": "automatic",
+        "options": {}
+      },
+      "name": "Baca cache riset",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        -800,
+        0
+      ],
+      "credentials": {
+        "redis": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Redis"
+        }
+      },
+      "id": "f1829368-0f36-1a24-c75b-4e9b09ea88fd"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n/code/risk_guard.js\n// Port JavaScript dari risk_engine/risk_engine.py untuk dijalankan di n8n Code node.\n//\n// PENTING: risk_engine.py adalah SPESIFIKASI. Berkas ini adalah salinan untuk runtime\n// n8n. Keduanya harus tetap sinkron -- bila salah satu diubah, ubah keduanya dan\n// jalankan `python -m pytest -q` serta bandingkan keluaran pada sinyal uji yang sama.\n//\n// Mode n8n Code node: \"Run Once for All Items\"\n// Input  : items = [{ json: { signal, equity, entry, rules, cfg, openPositions, breaker, now } }]\n// Output : [{ json: { ...decision, clientOrderId?, orderBody? } }]\n\nconst DEFAULT_TAKER_FEE = 0.0005;\nconst DEFAULT_MMR = 0.005;\n\n// ---------------------------------------------------------------- likuidasi\n\nfunction liquidationRoom(leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE) {\n  return 1 / leverage - mmr - fee;\n}\n\n// Jarak dari ENTRY ke harga likuidasi (fraksi). Identik dengan Python.\nfunction liquidationDistance(leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE, side = 'LONG') {\n  if (leverage <= 0) throw new Error('leverage harus > 0');\n  const s = String(side).toUpperCase();\n  if (s !== 'LONG' && s !== 'SHORT') throw new Error('side harus LONG atau SHORT');\n  const room = liquidationRoom(leverage, mmr, fee);\n  if (room <= 0) throw new Error(`leverage ${leverage}x tidak menyisakan ruang likuidasi`);\n  return s === 'SHORT' ? (room + fee) / (1 - fee) : (room + fee) / (1 + fee);\n}\n\nfunction liquidationPrice(side, entry, leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE) {\n  const s = String(side).toUpperCase();\n  const imr = 1 / leverage;\n  if (s === 'LONG') return (entry * (1 - imr + mmr + fee)) / (1 + fee);\n  if (s === 'SHORT') return (entry * (1 + imr - mmr - fee)) / (1 - fee);\n  throw new Error('side harus LONG atau SHORT');\n}\n\n// Guard: tolak entry bila estimator lokal tidak cocok dengan angka bursa.\nfunction checkLiqAgainstExchange(side, entry, localLiq, exchangeLiq, tolerance = 0.002) {\n  if (!exchangeLiq || exchangeLiq <= 0) return [false, 'EXCHANGE_LIQ_MISSING'];\n  const drift = Math.abs(localLiq - exchangeLiq) / entry;\n  if (drift > tolerance) return [false, `LIQ_MISMATCH drift=${drift.toFixed(5)} tol=${tolerance}`];\n  const s = String(side).toUpperCase();\n  if (s === 'LONG' && localLiq < exchangeLiq * (1 - tolerance)) return [false, 'LOCAL_LIQ_TOO_OPTIMISTIC_LONG'];\n  if (s === 'SHORT' && localLiq > exchangeLiq * (1 + tolerance)) return [false, 'LOCAL_LIQ_TOO_OPTIMISTIC_SHORT'];\n  return [true, 'OK'];\n}\n\nfunction maxUsableRr(leverage, stopDistance, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE,\n                     liqBufferPct = 33, targetFrac = 0.9) {\n  const d = liquidationDistance(leverage, mmr, fee);\n  const maxStop = d * (1 - liqBufferPct / 100);\n  if (stopDistance <= 0 || stopDistance > maxStop) return 0;\n  return (d * targetFrac) / stopDistance;\n}\n\n// ---------------------------------------------------------------- presisi\n\nfunction roundStep(value, step, mode = 'down') {\n  if (!(step > 0)) return value;\n  const n = mode === 'down' ? Math.floor(value / step + 1e-12) : Math.ceil(value / step - 1e-12);\n  return Math.round(n * step * 1e12) / 1e12;\n}\n\nfunction breakevenMove(fee = DEFAULT_TAKER_FEE) {\n  return fee * 2;\n}\n\n// ---------------------------------------------------------------- EV\n\nfunction expectedValue(winRate, avgWin, avgLoss, cost) {\n  return winRate * avgWin - (1 - winRate) * avgLoss - cost;\n}\n\nfunction minWinRateForProfit(rr, fee = DEFAULT_TAKER_FEE) {\n  const cost = breakevenMove(fee) * 100; // persen, agar satuannya sama dengan avg_win/avg_loss\n  return (1 + cost) / (1 + rr);\n}\n\n// ---------------------------------------------------------------- sizing\n\nfunction sizePosition(equity, entry, stopDistance, rules, cfg) {\n  if (!(equity > 0) || !(entry > 0)) return { qty: 0, reason: 'EQUITY_OR_ENTRY_INVALID' };\n  if (!(stopDistance > 0)) return { qty: 0, reason: 'STOP_DISTANCE_INVALID' };\n\n  const effStop = stopDistance + cfg.slippage_buffer_pct / 100;\n  const riskAmount = (equity * cfg.risk_per_trade_pct) / 100;\n\n  const qtyRisk = riskAmount / (entry * effStop);\n  const qtyLev = (equity * cfg.max_effective_leverage) / entry;\n  const qtyMargin = ((equity * cfg.max_margin_per_trade_pct) / 100) * cfg.leverage / entry;\n\n  const candidates = [\n    ['RISK_BUDGET', qtyRisk],\n    ['EFFECTIVE_LEVERAGE', qtyLev],\n    ['MARGIN_CAP', qtyMargin],\n  ];\n  let qty = Math.min(qtyRisk, qtyLev, qtyMargin);\n  let binding = candidates.reduce((a, b) => (b[1] < a[1] ? b : a))[0];\n\n  const ceiling = (equity * cfg.max_effective_leverage) / entry;\n  if (qty >= ceiling) {\n    qty = ceiling;\n    binding = 'EFFECTIVE_LEVERAGE_CEILING';\n  }\n\n  qty = roundStep(qty, rules.base_step, 'down');\n  qty = Math.min(qty, rules.max_size);\n  const notional = qty * entry;\n  return {\n    qty,\n    notional,\n    margin: notional / cfg.leverage,\n    risk_amount: qty * entry * effStop,\n    binding_constraint: binding,\n  };\n}\n\n// ---------------------------------------------------------------- gerbang utama\n\nfunction ageSec(iso, now) {\n  if (!iso) return Infinity;\n  const t = Date.parse(String(iso).replace('Z', '+00:00'));\n  if (Number.isNaN(t)) return Infinity;\n  return Math.max(0, (now - t) / 1000);\n}\n\n// DEFAULT DENY. Mengembalikan { approved, reasons, ... }.\nfunction validateSignal(signal, equity, entry, rules, cfg, opts = {}) {\n  const now = opts.now || Date.now();\n  const reasons = [];\n  const warnings = [];\n  const stats = signal.stats || {};\n\n  const direction = String(signal.direction || 'NONE').toUpperCase();\n  if (direction !== 'LONG' && direction !== 'SHORT') reasons.push('DIRECTION_NONE');\n\n  // --- Gerbang 1: MiroFish -------------------------------------------------\n  const miro = signal.mirofish || {};\n  if (!miro.schema_ok) reasons.push('MIROFISH_SCHEMA_INVALID');\n  const verdictAge = ageSec(miro.verdict_ts, now);\n  if (verdictAge > cfg.max_verdict_age_sec) reasons.push(`MIROFISH_STALE age=${verdictAge.toFixed(0)}s`);\n  const conf = Number(miro.confidence || 0);\n  if (conf < cfg.min_confidence) reasons.push(`MIROFISH_LOW_CONFIDENCE ${conf.toFixed(2)}<${cfg.min_confidence}`);\n  const eventRisk = String(miro.event_risk || 'UNKNOWN').toUpperCase();\n  if (cfg.veto_if_high_event_risk && eventRisk === 'HIGH') reasons.push('MIROFISH_HIGH_EVENT_RISK_VETO');\n  const bias = String(miro.bias || 'NEUTRAL').toUpperCase();\n  if (bias !== 'NEUTRAL' && bias !== direction && (direction === 'LONG' || direction === 'SHORT')) {\n    reasons.push(`MIROFISH_BIAS_CONFLICT ${bias} vs ${direction}`);\n  }\n\n  // --- Gerbang 2: struktur trade ------------------------------------------\n  const stop = Number(signal.stop);\n  const tp = Number(signal.take_profit);\n  let stopDistance = NaN;\n  let rr = 0;\n  let reward = NaN;\n  if (!Number.isFinite(stop) || !Number.isFinite(tp) || stop <= 0 || tp <= 0) {\n    reasons.push('MISSING_STOP_OR_TP');\n  } else {\n    if (direction === 'LONG') {\n      stopDistance = (entry - stop) / entry;\n      reward = (tp - entry) / entry;\n    } else {\n      stopDistance = (stop - entry) / entry;\n      reward = (entry - tp) / entry;\n    }\n    if (stopDistance <= 0) reasons.push('STOP_ON_WRONG_SIDE');\n    if (reward <= 0) reasons.push('TP_ON_WRONG_SIDE');\n    rr = stopDistance > 0 ? reward / stopDistance : 0;\n    if (rr < cfg.min_rr_ratio) reasons.push(`RR_TOO_LOW ${rr.toFixed(2)}<${cfg.min_rr_ratio}`);\n  }\n\n  const sigAge = ageSec(signal.ts, now);\n  if (sigAge > cfg.max_signal_age_sec) reasons.push(`SIGNAL_STALE age=${sigAge.toFixed(0)}s`);\n\n  // --- Gerbang 3: likuidasi ------------------------------------------------\n  let liqDist = NaN;\n  try {\n    liqDist = liquidationDistance(cfg.leverage, rules.mmr, rules.taker_fee, direction);\n  } catch (e) {\n    reasons.push(`LEVERAGE_CONFIG_INVALID ${e.message}`);\n  }\n  if (Number.isFinite(liqDist) && Number.isFinite(stopDistance)) {\n    const maxAllowed = liqDist * (1 - cfg.liq_buffer_pct / 100);\n    if (stopDistance >= maxAllowed) {\n      reasons.push(`STOP_TOO_FAR ${(stopDistance * 100).toFixed(4)}%>=${(maxAllowed * 100).toFixed(4)}%`);\n    }\n  }\n\n  // --- Gerbang 4: statistik & EV -------------------------------------------\n  const winRate = Number(stats.win_rate || 0);\n  const avgWin = Number(stats.avg_win_pct || 0);\n  const avgLoss = Number(stats.avg_loss_pct || 1);\n  const cost = breakevenMove(rules.taker_fee);\n  const ev = expectedValue(winRate, avgWin, avgLoss, cost);\n  if (winRate <= 0) reasons.push('NO_TRACK_RECORD');\n  else if (cfg.veto_on_negative_ev && ev <= 0) reasons.push(`NEGATIVE_EV ${ev.toFixed(5)}`);\n  if (Number.isFinite(stopDistance) && stopDistance > 0 && avgLoss > stopDistance * 1.05) {\n    reasons.push(`STATS_INCONSISTENT avg_loss=${avgLoss.toFixed(5)} > stop=${stopDistance.toFixed(5)}`);\n  }\n  if (avgWin > 0 && reward > 0 && avgWin > reward * 1.05) {\n    reasons.push(`STATS_INCONSISTENT avg_win=${avgWin.toFixed(5)} > reward=${reward.toFixed(5)}`);\n  }\n\n  // --- Gerbang 5: kapasitas & breaker --------------------------------------\n  const openPositions = Number(opts.openPositions || 0);\n  if (openPositions >= cfg.max_open_positions) {\n    reasons.push(`MAX_OPEN_POSITIONS ${openPositions}>=${cfg.max_open_positions}`);\n  }\n  if (opts.breaker && opts.breaker.tripped) {\n    reasons.push(`CIRCUIT_BREAKER_TRIPPED ${opts.breaker.reason || ''}`);\n  }\n\n  // --- Sizing --------------------------------------------------------------\n  let sizing = {};\n  if (Number.isFinite(stopDistance) && stopDistance > 0) {\n    sizing = sizePosition(equity, entry, stopDistance, rules, cfg);\n  }\n  const qty = Number(sizing.qty || 0);\n  const notional = Number(sizing.notional || 0);\n  if (qty <= 0) reasons.push('SIZE_ZERO');\n  else {\n    if (qty < rules.min_size) reasons.push(`BELOW_MIN_SIZE ${qty}<${rules.min_size}`);\n    if (notional < rules.min_notional) reasons.push(`BELOW_MIN_NOTIONAL ${notional}<${rules.min_notional}`);\n    if (notional > equity * cfg.max_effective_leverage) reasons.push('EFFECTIVE_LEVERAGE_BREACH');\n  }\n\n  // --- Peringatan ----------------------------------------------------------\n  if (Number.isFinite(liqDist) && liqDist < 0.02) {\n    warnings.push(`LIQ_DISTANCE_TINY ${(liqDist * 100).toFixed(3)}% -- ruang stop sempit`);\n  }\n  if (conf < 0.75) warnings.push('MIROFISH_CONFIDENCE_MARGINAL');\n  if (rules.taker_fee > 0.0005) warnings.push('HIGH_TAKER_FEE');\n\n  const approved = reasons.length === 0;\n  return {\n    approved,\n    reasons,\n    warnings,\n    size: approved ? qty : 0,\n    notional: approved ? notional : 0,\n    margin: approved ? Number(sizing.margin || 0) : 0,\n    stop_distance_pct: Number.isFinite(stopDistance) ? stopDistance : 0,\n    liq_distance_pct: Number.isFinite(liqDist) ? liqDist : 0,\n    risk_amount: approved ? Number(sizing.risk_amount || 0) : 0,\n    rr_ratio: rr,\n    ev_per_trade_pct: ev,\n    effective_leverage: approved && equity > 0 ? notional / equity : 0,\n    binding_constraint: sizing.binding_constraint || '',\n  };\n}\n\n// ---------------------------------------------------------------- idempotensi & signing\n\nfunction buildClientOrderId(signalId, symbol, action) {\n  const crypto = require('crypto');\n  const digest = crypto.createHash('sha256').update(`${signalId}|${symbol}|${action}`).digest('hex').slice(0, 24);\n  const act = String(action).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8) || 'ACT';\n  return `pg-${act}-${digest}`.slice(0, 64);\n}\n\nfunction signPionex(method, path, query, body, secret) {\n  const crypto = require('crypto');\n  const joined = Object.keys(query).sort().map((k) => `${k}=${query[k]}`).join('&');\n  const pathUrl = joined ? `${path}?${joined}` : path;\n  let payload = `${method.toUpperCase()}${pathUrl}`;\n  if (method.toUpperCase() === 'POST' || method.toUpperCase() === 'DELETE') payload += body || '';\n  return crypto.createHmac('sha256', secret).update(payload, 'utf8').digest('hex');\n}\n\n// ---------------------------------------------------------------- entry point n8n\n\n\n// Di n8n Code node, tempelkan fungsi-fungsi di atas lalu akhiri dengan blok berikut\n// (module.exports diabaikan oleh n8n, tetapi membuat berkas ini bisa di-require saat uji):\n/*\n  const out = [];\n  for (const item of items) {\n    const { signal, equity, entry, rules, cfg, openPositions, breaker } = item.json;\n    const decision = validateSignal(signal, equity, entry, rules, cfg,\n                                    { openPositions, breaker, now: Date.now() });\n    out.push({ json: { ...decision, signal_id: signal.id || null } });\n  }\n  return out;\n*/\n\n// ---- entry point n8n: bangun satu panggilan LLM per agen ---------------------------\n// Code node karena tidak ada node asli yang bisa merangkai daftar peran menjadi\n// beberapa item dengan prompt berbeda. Selebihnya aliran ini memakai node asli.\n//\n// PENTING: di mode \"Run Once for All Items\", $json TIDAK dijamin terisi. Membaca\n// $json di sini menghasilkan {} dan seluruh konteks pasar hilang tanpa error --\n// prompt terkirim kosong dan para agen menjawab dari imajinasi. Karena itu masukan\n// selalu diambil dari `items` secara eksplisit.\nconst cache = (items[0] && items[0].json && items[0].json.cache) || {};\nconst context = JSON.stringify({\n  symbol: cache.symbol || $env.PIONEX_SYMBOL,\n  collected_at: cache.collected_at || null,\n  fear_greed: cache.fear_greed || null,\n  tone_berita: cache.tone || null,\n  volume_berita: cache.volume || null,\n  berita_negatif: (cache.negative || []).slice(0, 15),\n  aliran_stablecoin: cache.stablecoin || null,\n  funding: cache.funding || null,\n});\n\nconst AGENTS = [[\"makro\", \"Analis makro. Anda hanya peduli pada likuiditas global, kebijakan bank sentral, data inflasi, dan aliran stablecoin. Abaikan grafik harga.\"], [\"arus_modal\", \"Analis aliran modal. Anda membaca Fear & Greed, pasokan stablecoin, dan funding rate untuk menyimpulkan apakah uang sedang masuk atau keluar dari kripto.\"], [\"risiko_ekstrem\", \"Analis risiko peristiwa. Tugas Anda HANYA mencari hal yang bisa mengguncang harga tiba-tiba: peretasan, kebangkrutan, tindakan regulator, depeg, gangguan bursa. Bila tidak ada, katakan tidak ada. Jangan mengarang risiko.\"], [\"kontrarian\", \"Anda wajib berargumen melawan konsensus. Bila semua sinyal bullish, jelaskan kenapa itu bisa salah. Bila bearish, jelaskan sisi sebaliknya. Tugas Anda menguji, bukan menyenangkan.\"], [\"mikrostruktur\", \"Analis mikrostruktur pasar. Anda membaca funding rate dan volatilitas untuk menyimpulkan apakah posisi pasar sudah terlalu padat ke satu arah.\"]];\nconst model = $env.LLM_MODEL || 'gpt-4o-mini';\n\nreturn AGENTS.map((pair) => ({ json: {\n  agent: pair[0],\n  body: JSON.stringify({\n    model,\n    temperature: 0.2,\n    response_format: { type: 'json_object' },\n    messages: [\n      { role: 'system', content:\n          'Anda adalah ' + pair[1] + ' Jawab HANYA dalam JSON dengan kunci: '\n        + '\"stance\" (LONG|SHORT|NEUTRAL), \"confidence\" (0 sampai 1), '\n        + '\"event_risk\" (LOW|MEDIUM|HIGH), \"alasan\" (maks 2 kalimat), '\n        + '\"bukti\" (array string, sebutkan angka atau judul berita yang Anda pakai). '\n        + 'Bila data tidak cukup, gunakan confidence rendah dan stance NEUTRAL. '\n        + 'Jangan mengarang data yang tidak ada di konteks.' },\n      { role: 'user', content: context },\n    ],\n  }),\n} }));\n"
+      },
+      "id": "b640001e-6291-349f-bca0-0c3f1bfcf6f2",
+      "name": "Bangun panggilan agen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -600,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LLM_API_BASE }}/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.LLM_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.body }}"
+      },
+      "id": "2c967c28-966d-ea9f-85a0-a5cda57cd536",
+      "name": "LLM paralel (5 agen)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -350,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n/code/risk_guard.js\n// Port JavaScript dari risk_engine/risk_engine.py untuk dijalankan di n8n Code node.\n//\n// PENTING: risk_engine.py adalah SPESIFIKASI. Berkas ini adalah salinan untuk runtime\n// n8n. Keduanya harus tetap sinkron -- bila salah satu diubah, ubah keduanya dan\n// jalankan `python -m pytest -q` serta bandingkan keluaran pada sinyal uji yang sama.\n//\n// Mode n8n Code node: \"Run Once for All Items\"\n// Input  : items = [{ json: { signal, equity, entry, rules, cfg, openPositions, breaker, now } }]\n// Output : [{ json: { ...decision, clientOrderId?, orderBody? } }]\n\nconst DEFAULT_TAKER_FEE = 0.0005;\nconst DEFAULT_MMR = 0.005;\n\n// ---------------------------------------------------------------- likuidasi\n\nfunction liquidationRoom(leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE) {\n  return 1 / leverage - mmr - fee;\n}\n\n// Jarak dari ENTRY ke harga likuidasi (fraksi). Identik dengan Python.\nfunction liquidationDistance(leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE, side = 'LONG') {\n  if (leverage <= 0) throw new Error('leverage harus > 0');\n  const s = String(side).toUpperCase();\n  if (s !== 'LONG' && s !== 'SHORT') throw new Error('side harus LONG atau SHORT');\n  const room = liquidationRoom(leverage, mmr, fee);\n  if (room <= 0) throw new Error(`leverage ${leverage}x tidak menyisakan ruang likuidasi`);\n  return s === 'SHORT' ? (room + fee) / (1 - fee) : (room + fee) / (1 + fee);\n}\n\nfunction liquidationPrice(side, entry, leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE) {\n  const s = String(side).toUpperCase();\n  const imr = 1 / leverage;\n  if (s === 'LONG') return (entry * (1 - imr + mmr + fee)) / (1 + fee);\n  if (s === 'SHORT') return (entry * (1 + imr - mmr - fee)) / (1 - fee);\n  throw new Error('side harus LONG atau SHORT');\n}\n\n// Guard: tolak entry bila estimator lokal tidak cocok dengan angka bursa.\nfunction checkLiqAgainstExchange(side, entry, localLiq, exchangeLiq, tolerance = 0.002) {\n  if (!exchangeLiq || exchangeLiq <= 0) return [false, 'EXCHANGE_LIQ_MISSING'];\n  const drift = Math.abs(localLiq - exchangeLiq) / entry;\n  if (drift > tolerance) return [false, `LIQ_MISMATCH drift=${drift.toFixed(5)} tol=${tolerance}`];\n  const s = String(side).toUpperCase();\n  if (s === 'LONG' && localLiq < exchangeLiq * (1 - tolerance)) return [false, 'LOCAL_LIQ_TOO_OPTIMISTIC_LONG'];\n  if (s === 'SHORT' && localLiq > exchangeLiq * (1 + tolerance)) return [false, 'LOCAL_LIQ_TOO_OPTIMISTIC_SHORT'];\n  return [true, 'OK'];\n}\n\nfunction maxUsableRr(leverage, stopDistance, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE,\n                     liqBufferPct = 33, targetFrac = 0.9) {\n  const d = liquidationDistance(leverage, mmr, fee);\n  const maxStop = d * (1 - liqBufferPct / 100);\n  if (stopDistance <= 0 || stopDistance > maxStop) return 0;\n  return (d * targetFrac) / stopDistance;\n}\n\n// ---------------------------------------------------------------- presisi\n\nfunction roundStep(value, step, mode = 'down') {\n  if (!(step > 0)) return value;\n  const n = mode === 'down' ? Math.floor(value / step + 1e-12) : Math.ceil(value / step - 1e-12);\n  return Math.round(n * step * 1e12) / 1e12;\n}\n\nfunction breakevenMove(fee = DEFAULT_TAKER_FEE) {\n  return fee * 2;\n}\n\n// ---------------------------------------------------------------- EV\n\nfunction expectedValue(winRate, avgWin, avgLoss, cost) {\n  return winRate * avgWin - (1 - winRate) * avgLoss - cost;\n}\n\nfunction minWinRateForProfit(rr, fee = DEFAULT_TAKER_FEE) {\n  const cost = breakevenMove(fee) * 100; // persen, agar satuannya sama dengan avg_win/avg_loss\n  return (1 + cost) / (1 + rr);\n}\n\n// ---------------------------------------------------------------- sizing\n\nfunction sizePosition(equity, entry, stopDistance, rules, cfg) {\n  if (!(equity > 0) || !(entry > 0)) return { qty: 0, reason: 'EQUITY_OR_ENTRY_INVALID' };\n  if (!(stopDistance > 0)) return { qty: 0, reason: 'STOP_DISTANCE_INVALID' };\n\n  const effStop = stopDistance + cfg.slippage_buffer_pct / 100;\n  const riskAmount = (equity * cfg.risk_per_trade_pct) / 100;\n\n  const qtyRisk = riskAmount / (entry * effStop);\n  const qtyLev = (equity * cfg.max_effective_leverage) / entry;\n  const qtyMargin = ((equity * cfg.max_margin_per_trade_pct) / 100) * cfg.leverage / entry;\n\n  const candidates = [\n    ['RISK_BUDGET', qtyRisk],\n    ['EFFECTIVE_LEVERAGE', qtyLev],\n    ['MARGIN_CAP', qtyMargin],\n  ];\n  let qty = Math.min(qtyRisk, qtyLev, qtyMargin);\n  let binding = candidates.reduce((a, b) => (b[1] < a[1] ? b : a))[0];\n\n  const ceiling = (equity * cfg.max_effective_leverage) / entry;\n  if (qty >= ceiling) {\n    qty = ceiling;\n    binding = 'EFFECTIVE_LEVERAGE_CEILING';\n  }\n\n  qty = roundStep(qty, rules.base_step, 'down');\n  qty = Math.min(qty, rules.max_size);\n  const notional = qty * entry;\n  return {\n    qty,\n    notional,\n    margin: notional / cfg.leverage,\n    risk_amount: qty * entry * effStop,\n    binding_constraint: binding,\n  };\n}\n\n// ---------------------------------------------------------------- gerbang utama\n\nfunction ageSec(iso, now) {\n  if (!iso) return Infinity;\n  const t = Date.parse(String(iso).replace('Z', '+00:00'));\n  if (Number.isNaN(t)) return Infinity;\n  return Math.max(0, (now - t) / 1000);\n}\n\n// DEFAULT DENY. Mengembalikan { approved, reasons, ... }.\nfunction validateSignal(signal, equity, entry, rules, cfg, opts = {}) {\n  const now = opts.now || Date.now();\n  const reasons = [];\n  const warnings = [];\n  const stats = signal.stats || {};\n\n  const direction = String(signal.direction || 'NONE').toUpperCase();\n  if (direction !== 'LONG' && direction !== 'SHORT') reasons.push('DIRECTION_NONE');\n\n  // --- Gerbang 1: MiroFish -------------------------------------------------\n  const miro = signal.mirofish || {};\n  if (!miro.schema_ok) reasons.push('MIROFISH_SCHEMA_INVALID');\n  const verdictAge = ageSec(miro.verdict_ts, now);\n  if (verdictAge > cfg.max_verdict_age_sec) reasons.push(`MIROFISH_STALE age=${verdictAge.toFixed(0)}s`);\n  const conf = Number(miro.confidence || 0);\n  if (conf < cfg.min_confidence) reasons.push(`MIROFISH_LOW_CONFIDENCE ${conf.toFixed(2)}<${cfg.min_confidence}`);\n  const eventRisk = String(miro.event_risk || 'UNKNOWN').toUpperCase();\n  if (cfg.veto_if_high_event_risk && eventRisk === 'HIGH') reasons.push('MIROFISH_HIGH_EVENT_RISK_VETO');\n  const bias = String(miro.bias || 'NEUTRAL').toUpperCase();\n  if (bias !== 'NEUTRAL' && bias !== direction && (direction === 'LONG' || direction === 'SHORT')) {\n    reasons.push(`MIROFISH_BIAS_CONFLICT ${bias} vs ${direction}`);\n  }\n\n  // --- Gerbang 2: struktur trade ------------------------------------------\n  const stop = Number(signal.stop);\n  const tp = Number(signal.take_profit);\n  let stopDistance = NaN;\n  let rr = 0;\n  let reward = NaN;\n  if (!Number.isFinite(stop) || !Number.isFinite(tp) || stop <= 0 || tp <= 0) {\n    reasons.push('MISSING_STOP_OR_TP');\n  } else {\n    if (direction === 'LONG') {\n      stopDistance = (entry - stop) / entry;\n      reward = (tp - entry) / entry;\n    } else {\n      stopDistance = (stop - entry) / entry;\n      reward = (entry - tp) / entry;\n    }\n    if (stopDistance <= 0) reasons.push('STOP_ON_WRONG_SIDE');\n    if (reward <= 0) reasons.push('TP_ON_WRONG_SIDE');\n    rr = stopDistance > 0 ? reward / stopDistance : 0;\n    if (rr < cfg.min_rr_ratio) reasons.push(`RR_TOO_LOW ${rr.toFixed(2)}<${cfg.min_rr_ratio}`);\n  }\n\n  const sigAge = ageSec(signal.ts, now);\n  if (sigAge > cfg.max_signal_age_sec) reasons.push(`SIGNAL_STALE age=${sigAge.toFixed(0)}s`);\n\n  // --- Gerbang 3: likuidasi ------------------------------------------------\n  let liqDist = NaN;\n  try {\n    liqDist = liquidationDistance(cfg.leverage, rules.mmr, rules.taker_fee, direction);\n  } catch (e) {\n    reasons.push(`LEVERAGE_CONFIG_INVALID ${e.message}`);\n  }\n  if (Number.isFinite(liqDist) && Number.isFinite(stopDistance)) {\n    const maxAllowed = liqDist * (1 - cfg.liq_buffer_pct / 100);\n    if (stopDistance >= maxAllowed) {\n      reasons.push(`STOP_TOO_FAR ${(stopDistance * 100).toFixed(4)}%>=${(maxAllowed * 100).toFixed(4)}%`);\n    }\n  }\n\n  // --- Gerbang 4: statistik & EV -------------------------------------------\n  const winRate = Number(stats.win_rate || 0);\n  const avgWin = Number(stats.avg_win_pct || 0);\n  const avgLoss = Number(stats.avg_loss_pct || 1);\n  const cost = breakevenMove(rules.taker_fee);\n  const ev = expectedValue(winRate, avgWin, avgLoss, cost);\n  if (winRate <= 0) reasons.push('NO_TRACK_RECORD');\n  else if (cfg.veto_on_negative_ev && ev <= 0) reasons.push(`NEGATIVE_EV ${ev.toFixed(5)}`);\n  if (Number.isFinite(stopDistance) && stopDistance > 0 && avgLoss > stopDistance * 1.05) {\n    reasons.push(`STATS_INCONSISTENT avg_loss=${avgLoss.toFixed(5)} > stop=${stopDistance.toFixed(5)}`);\n  }\n  if (avgWin > 0 && reward > 0 && avgWin > reward * 1.05) {\n    reasons.push(`STATS_INCONSISTENT avg_win=${avgWin.toFixed(5)} > reward=${reward.toFixed(5)}`);\n  }\n\n  // --- Gerbang 5: kapasitas & breaker --------------------------------------\n  const openPositions = Number(opts.openPositions || 0);\n  if (openPositions >= cfg.max_open_positions) {\n    reasons.push(`MAX_OPEN_POSITIONS ${openPositions}>=${cfg.max_open_positions}`);\n  }\n  if (opts.breaker && opts.breaker.tripped) {\n    reasons.push(`CIRCUIT_BREAKER_TRIPPED ${opts.breaker.reason || ''}`);\n  }\n\n  // --- Sizing --------------------------------------------------------------\n  let sizing = {};\n  if (Number.isFinite(stopDistance) && stopDistance > 0) {\n    sizing = sizePosition(equity, entry, stopDistance, rules, cfg);\n  }\n  const qty = Number(sizing.qty || 0);\n  const notional = Number(sizing.notional || 0);\n  if (qty <= 0) reasons.push('SIZE_ZERO');\n  else {\n    if (qty < rules.min_size) reasons.push(`BELOW_MIN_SIZE ${qty}<${rules.min_size}`);\n    if (notional < rules.min_notional) reasons.push(`BELOW_MIN_NOTIONAL ${notional}<${rules.min_notional}`);\n    if (notional > equity * cfg.max_effective_leverage) reasons.push('EFFECTIVE_LEVERAGE_BREACH');\n  }\n\n  // --- Peringatan ----------------------------------------------------------\n  if (Number.isFinite(liqDist) && liqDist < 0.02) {\n    warnings.push(`LIQ_DISTANCE_TINY ${(liqDist * 100).toFixed(3)}% -- ruang stop sempit`);\n  }\n  if (conf < 0.75) warnings.push('MIROFISH_CONFIDENCE_MARGINAL');\n  if (rules.taker_fee > 0.0005) warnings.push('HIGH_TAKER_FEE');\n\n  const approved = reasons.length === 0;\n  return {\n    approved,\n    reasons,\n    warnings,\n    size: approved ? qty : 0,\n    notional: approved ? notional : 0,\n    margin: approved ? Number(sizing.margin || 0) : 0,\n    stop_distance_pct: Number.isFinite(stopDistance) ? stopDistance : 0,\n    liq_distance_pct: Number.isFinite(liqDist) ? liqDist : 0,\n    risk_amount: approved ? Number(sizing.risk_amount || 0) : 0,\n    rr_ratio: rr,\n    ev_per_trade_pct: ev,\n    effective_leverage: approved && equity > 0 ? notional / equity : 0,\n    binding_constraint: sizing.binding_constraint || '',\n  };\n}\n\n// ---------------------------------------------------------------- idempotensi & signing\n\nfunction buildClientOrderId(signalId, symbol, action) {\n  const crypto = require('crypto');\n  const digest = crypto.createHash('sha256').update(`${signalId}|${symbol}|${action}`).digest('hex').slice(0, 24);\n  const act = String(action).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8) || 'ACT';\n  return `pg-${act}-${digest}`.slice(0, 64);\n}\n\nfunction signPionex(method, path, query, body, secret) {\n  const crypto = require('crypto');\n  const joined = Object.keys(query).sort().map((k) => `${k}=${query[k]}`).join('&');\n  const pathUrl = joined ? `${path}?${joined}` : path;\n  let payload = `${method.toUpperCase()}${pathUrl}`;\n  if (method.toUpperCase() === 'POST' || method.toUpperCase() === 'DELETE') payload += body || '';\n  return crypto.createHmac('sha256', secret).update(payload, 'utf8').digest('hex');\n}\n\n// ---------------------------------------------------------------- entry point n8n\n\n\n// Di n8n Code node, tempelkan fungsi-fungsi di atas lalu akhiri dengan blok berikut\n// (module.exports diabaikan oleh n8n, tetapi membuat berkas ini bisa di-require saat uji):\n/*\n  const out = [];\n  for (const item of items) {\n    const { signal, equity, entry, rules, cfg, openPositions, breaker } = item.json;\n    const decision = validateSignal(signal, equity, entry, rules, cfg,\n                                    { openPositions, breaker, now: Date.now() });\n    out.push({ json: { ...decision, signal_id: signal.id || null } });\n  }\n  return out;\n*/\n\n// Mengambil objek JSON pertama dari teks LLM.\n// Regex seperti pola \"buang semua setelah kurung kurawal terakhir\" TIDAK boleh dipakai\n// di sini: pola semacam itu memotong objek valid tepat di kurung kurawal pertama, jadi\n// JSON yang benar justru terbaca sebagai gagal. Yang dipakai adalah pemindaian\n// berbasis kedalaman kurung, yang berhenti hanya bila kurung benar-benar seimbang.\nfunction extractJsonObject(text) {\n  if (typeof text !== 'string') return null;\n  const start = text.indexOf('{');\n  if (start < 0) return null;\n  let depth = 0;\n  let inString = false;\n  let escaped = false;\n  for (let i = start; i < text.length; i += 1) {\n    const c = text[i];\n    if (inString) {\n      if (escaped) escaped = false;\n      else if (c === String.fromCharCode(92)) escaped = true;\n      else if (c === '\"') inString = false;\n      continue;\n    }\n    if (c === '\"') inString = true;\n    else if (c === '{') depth += 1;\n    else if (c === '}') {\n      depth -= 1;\n      if (depth === 0) {\n        try { return JSON.parse(text.slice(start, i + 1)); } catch (e) { return null; }\n      }\n    }\n  }\n  return null;\n}\n\n// ---- entry point n8n: simpulkan pendapat para agen --------------------------------\n// Code node ini melakukan dua hal yang tidak bisa dilakukan node asli:\n//   1. menggabungkan N jawaban agen menjadi satu konteks,\n//   2. mem-PARSE JSON keluaran LLM. Parser ini sengaja ketat: LLM bisa membalas teks\n//      di luar JSON, dan aturan sistem ini adalah \"gagal = veto\", bukan \"tebak\".\nconst model = $env.LLM_MODEL || 'gpt-4o-mini';\nconst opinions = [];\nfor (const item of items) {\n  const j = item.json || {};\n  const raw = (j.choices && j.choices[0] && j.choices[0].message\n               && j.choices[0].message.content) || null;\n  const parsed = extractJsonObject(raw);\n  opinions.push({ agen: j.agent || 'tidak_diketahui', mentah: raw || null, parsed });\n\n}\n\nconst gagal = opinions.filter((o) => !o.parsed).length;\n\nconst body = JSON.stringify({\n  model,\n  temperature: 0.1,\n  response_format: { type: 'json_object' },\n  messages: [\n    { role: 'system', content:\n        'Anda menyimpulkan diskusi beberapa analis. Jawab HANYA dalam JSON dengan kunci: '\n      + '\"prediction\" (minimal 20 kata, ringkasan kesimpulan), \"confidence\" (0 sampai 1), '\n      + '\"event_risk\" (LOW|MEDIUM|HIGH), \"key_dynamics\" (array string), '\n      + '\"signals\" (array string). Aturan keras: bila analis tidak sepakat, confidence '\n      + 'harus di bawah 0.6 dan event_risk tidak boleh LOW. Bila ada satu saja analis '\n      + 'menyebut risiko peristiwa konkret, event_risk minimal MEDIUM. '\n      + 'Confidence maksimum 0.85: Anda menyimpulkan opini, bukan mengukur probabilitas.' },\n    { role: 'user', content: JSON.stringify({ jumlah_agen: opinions.length,\n                                              agen_gagal: gagal, pendapat: opinions }) },\n  ],\n});\n\nreturn [{ json: { agent: 'sintesis', agen_gagal: gagal,\n                  jumlah_agen: opinions.length, body } }];\n"
+      },
+      "id": "e59cf2fb-5238-c9da-f0c7-f16778cc3307",
+      "name": "Simpulkan pendapat agen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LLM_API_BASE }}/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.LLM_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.body }}"
+      },
+      "id": "143bfd61-15fe-852f-9dc2-47fc0416bdd1",
+      "name": "LLM sintesis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        150,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n/code/risk_guard.js\n// Port JavaScript dari risk_engine/risk_engine.py untuk dijalankan di n8n Code node.\n//\n// PENTING: risk_engine.py adalah SPESIFIKASI. Berkas ini adalah salinan untuk runtime\n// n8n. Keduanya harus tetap sinkron -- bila salah satu diubah, ubah keduanya dan\n// jalankan `python -m pytest -q` serta bandingkan keluaran pada sinyal uji yang sama.\n//\n// Mode n8n Code node: \"Run Once for All Items\"\n// Input  : items = [{ json: { signal, equity, entry, rules, cfg, openPositions, breaker, now } }]\n// Output : [{ json: { ...decision, clientOrderId?, orderBody? } }]\n\nconst DEFAULT_TAKER_FEE = 0.0005;\nconst DEFAULT_MMR = 0.005;\n\n// ---------------------------------------------------------------- likuidasi\n\nfunction liquidationRoom(leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE) {\n  return 1 / leverage - mmr - fee;\n}\n\n// Jarak dari ENTRY ke harga likuidasi (fraksi). Identik dengan Python.\nfunction liquidationDistance(leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE, side = 'LONG') {\n  if (leverage <= 0) throw new Error('leverage harus > 0');\n  const s = String(side).toUpperCase();\n  if (s !== 'LONG' && s !== 'SHORT') throw new Error('side harus LONG atau SHORT');\n  const room = liquidationRoom(leverage, mmr, fee);\n  if (room <= 0) throw new Error(`leverage ${leverage}x tidak menyisakan ruang likuidasi`);\n  return s === 'SHORT' ? (room + fee) / (1 - fee) : (room + fee) / (1 + fee);\n}\n\nfunction liquidationPrice(side, entry, leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE) {\n  const s = String(side).toUpperCase();\n  const imr = 1 / leverage;\n  if (s === 'LONG') return (entry * (1 - imr + mmr + fee)) / (1 + fee);\n  if (s === 'SHORT') return (entry * (1 + imr - mmr - fee)) / (1 - fee);\n  throw new Error('side harus LONG atau SHORT');\n}\n\n// Guard: tolak entry bila estimator lokal tidak cocok dengan angka bursa.\nfunction checkLiqAgainstExchange(side, entry, localLiq, exchangeLiq, tolerance = 0.002) {\n  if (!exchangeLiq || exchangeLiq <= 0) return [false, 'EXCHANGE_LIQ_MISSING'];\n  const drift = Math.abs(localLiq - exchangeLiq) / entry;\n  if (drift > tolerance) return [false, `LIQ_MISMATCH drift=${drift.toFixed(5)} tol=${tolerance}`];\n  const s = String(side).toUpperCase();\n  if (s === 'LONG' && localLiq < exchangeLiq * (1 - tolerance)) return [false, 'LOCAL_LIQ_TOO_OPTIMISTIC_LONG'];\n  if (s === 'SHORT' && localLiq > exchangeLiq * (1 + tolerance)) return [false, 'LOCAL_LIQ_TOO_OPTIMISTIC_SHORT'];\n  return [true, 'OK'];\n}\n\nfunction maxUsableRr(leverage, stopDistance, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE,\n                     liqBufferPct = 33, targetFrac = 0.9) {\n  const d = liquidationDistance(leverage, mmr, fee);\n  const maxStop = d * (1 - liqBufferPct / 100);\n  if (stopDistance <= 0 || stopDistance > maxStop) return 0;\n  return (d * targetFrac) / stopDistance;\n}\n\n// ---------------------------------------------------------------- presisi\n\nfunction roundStep(value, step, mode = 'down') {\n  if (!(step > 0)) return value;\n  const n = mode === 'down' ? Math.floor(value / step + 1e-12) : Math.ceil(value / step - 1e-12);\n  return Math.round(n * step * 1e12) / 1e12;\n}\n\nfunction breakevenMove(fee = DEFAULT_TAKER_FEE) {\n  return fee * 2;\n}\n\n// ---------------------------------------------------------------- EV\n\nfunction expectedValue(winRate, avgWin, avgLoss, cost) {\n  return winRate * avgWin - (1 - winRate) * avgLoss - cost;\n}\n\nfunction minWinRateForProfit(rr, fee = DEFAULT_TAKER_FEE) {\n  const cost = breakevenMove(fee) * 100; // persen, agar satuannya sama dengan avg_win/avg_loss\n  return (1 + cost) / (1 + rr);\n}\n\n// ---------------------------------------------------------------- sizing\n\nfunction sizePosition(equity, entry, stopDistance, rules, cfg) {\n  if (!(equity > 0) || !(entry > 0)) return { qty: 0, reason: 'EQUITY_OR_ENTRY_INVALID' };\n  if (!(stopDistance > 0)) return { qty: 0, reason: 'STOP_DISTANCE_INVALID' };\n\n  const effStop = stopDistance + cfg.slippage_buffer_pct / 100;\n  const riskAmount = (equity * cfg.risk_per_trade_pct) / 100;\n\n  const qtyRisk = riskAmount / (entry * effStop);\n  const qtyLev = (equity * cfg.max_effective_leverage) / entry;\n  const qtyMargin = ((equity * cfg.max_margin_per_trade_pct) / 100) * cfg.leverage / entry;\n\n  const candidates = [\n    ['RISK_BUDGET', qtyRisk],\n    ['EFFECTIVE_LEVERAGE', qtyLev],\n    ['MARGIN_CAP', qtyMargin],\n  ];\n  let qty = Math.min(qtyRisk, qtyLev, qtyMargin);\n  let binding = candidates.reduce((a, b) => (b[1] < a[1] ? b : a))[0];\n\n  const ceiling = (equity * cfg.max_effective_leverage) / entry;\n  if (qty >= ceiling) {\n    qty = ceiling;\n    binding = 'EFFECTIVE_LEVERAGE_CEILING';\n  }\n\n  qty = roundStep(qty, rules.base_step, 'down');\n  qty = Math.min(qty, rules.max_size);\n  const notional = qty * entry;\n  return {\n    qty,\n    notional,\n    margin: notional / cfg.leverage,\n    risk_amount: qty * entry * effStop,\n    binding_constraint: binding,\n  };\n}\n\n// ---------------------------------------------------------------- gerbang utama\n\nfunction ageSec(iso, now) {\n  if (!iso) return Infinity;\n  const t = Date.parse(String(iso).replace('Z', '+00:00'));\n  if (Number.isNaN(t)) return Infinity;\n  return Math.max(0, (now - t) / 1000);\n}\n\n// DEFAULT DENY. Mengembalikan { approved, reasons, ... }.\nfunction validateSignal(signal, equity, entry, rules, cfg, opts = {}) {\n  const now = opts.now || Date.now();\n  const reasons = [];\n  const warnings = [];\n  const stats = signal.stats || {};\n\n  const direction = String(signal.direction || 'NONE').toUpperCase();\n  if (direction !== 'LONG' && direction !== 'SHORT') reasons.push('DIRECTION_NONE');\n\n  // --- Gerbang 1: MiroFish -------------------------------------------------\n  const miro = signal.mirofish || {};\n  if (!miro.schema_ok) reasons.push('MIROFISH_SCHEMA_INVALID');\n  const verdictAge = ageSec(miro.verdict_ts, now);\n  if (verdictAge > cfg.max_verdict_age_sec) reasons.push(`MIROFISH_STALE age=${verdictAge.toFixed(0)}s`);\n  const conf = Number(miro.confidence || 0);\n  if (conf < cfg.min_confidence) reasons.push(`MIROFISH_LOW_CONFIDENCE ${conf.toFixed(2)}<${cfg.min_confidence}`);\n  const eventRisk = String(miro.event_risk || 'UNKNOWN').toUpperCase();\n  if (cfg.veto_if_high_event_risk && eventRisk === 'HIGH') reasons.push('MIROFISH_HIGH_EVENT_RISK_VETO');\n  const bias = String(miro.bias || 'NEUTRAL').toUpperCase();\n  if (bias !== 'NEUTRAL' && bias !== direction && (direction === 'LONG' || direction === 'SHORT')) {\n    reasons.push(`MIROFISH_BIAS_CONFLICT ${bias} vs ${direction}`);\n  }\n\n  // --- Gerbang 2: struktur trade ------------------------------------------\n  const stop = Number(signal.stop);\n  const tp = Number(signal.take_profit);\n  let stopDistance = NaN;\n  let rr = 0;\n  let reward = NaN;\n  if (!Number.isFinite(stop) || !Number.isFinite(tp) || stop <= 0 || tp <= 0) {\n    reasons.push('MISSING_STOP_OR_TP');\n  } else {\n    if (direction === 'LONG') {\n      stopDistance = (entry - stop) / entry;\n      reward = (tp - entry) / entry;\n    } else {\n      stopDistance = (stop - entry) / entry;\n      reward = (entry - tp) / entry;\n    }\n    if (stopDistance <= 0) reasons.push('STOP_ON_WRONG_SIDE');\n    if (reward <= 0) reasons.push('TP_ON_WRONG_SIDE');\n    rr = stopDistance > 0 ? reward / stopDistance : 0;\n    if (rr < cfg.min_rr_ratio) reasons.push(`RR_TOO_LOW ${rr.toFixed(2)}<${cfg.min_rr_ratio}`);\n  }\n\n  const sigAge = ageSec(signal.ts, now);\n  if (sigAge > cfg.max_signal_age_sec) reasons.push(`SIGNAL_STALE age=${sigAge.toFixed(0)}s`);\n\n  // --- Gerbang 3: likuidasi ------------------------------------------------\n  let liqDist = NaN;\n  try {\n    liqDist = liquidationDistance(cfg.leverage, rules.mmr, rules.taker_fee, direction);\n  } catch (e) {\n    reasons.push(`LEVERAGE_CONFIG_INVALID ${e.message}`);\n  }\n  if (Number.isFinite(liqDist) && Number.isFinite(stopDistance)) {\n    const maxAllowed = liqDist * (1 - cfg.liq_buffer_pct / 100);\n    if (stopDistance >= maxAllowed) {\n      reasons.push(`STOP_TOO_FAR ${(stopDistance * 100).toFixed(4)}%>=${(maxAllowed * 100).toFixed(4)}%`);\n    }\n  }\n\n  // --- Gerbang 4: statistik & EV -------------------------------------------\n  const winRate = Number(stats.win_rate || 0);\n  const avgWin = Number(stats.avg_win_pct || 0);\n  const avgLoss = Number(stats.avg_loss_pct || 1);\n  const cost = breakevenMove(rules.taker_fee);\n  const ev = expectedValue(winRate, avgWin, avgLoss, cost);\n  if (winRate <= 0) reasons.push('NO_TRACK_RECORD');\n  else if (cfg.veto_on_negative_ev && ev <= 0) reasons.push(`NEGATIVE_EV ${ev.toFixed(5)}`);\n  if (Number.isFinite(stopDistance) && stopDistance > 0 && avgLoss > stopDistance * 1.05) {\n    reasons.push(`STATS_INCONSISTENT avg_loss=${avgLoss.toFixed(5)} > stop=${stopDistance.toFixed(5)}`);\n  }\n  if (avgWin > 0 && reward > 0 && avgWin > reward * 1.05) {\n    reasons.push(`STATS_INCONSISTENT avg_win=${avgWin.toFixed(5)} > reward=${reward.toFixed(5)}`);\n  }\n\n  // --- Gerbang 5: kapasitas & breaker --------------------------------------\n  const openPositions = Number(opts.openPositions || 0);\n  if (openPositions >= cfg.max_open_positions) {\n    reasons.push(`MAX_OPEN_POSITIONS ${openPositions}>=${cfg.max_open_positions}`);\n  }\n  if (opts.breaker && opts.breaker.tripped) {\n    reasons.push(`CIRCUIT_BREAKER_TRIPPED ${opts.breaker.reason || ''}`);\n  }\n\n  // --- Sizing --------------------------------------------------------------\n  let sizing = {};\n  if (Number.isFinite(stopDistance) && stopDistance > 0) {\n    sizing = sizePosition(equity, entry, stopDistance, rules, cfg);\n  }\n  const qty = Number(sizing.qty || 0);\n  const notional = Number(sizing.notional || 0);\n  if (qty <= 0) reasons.push('SIZE_ZERO');\n  else {\n    if (qty < rules.min_size) reasons.push(`BELOW_MIN_SIZE ${qty}<${rules.min_size}`);\n    if (notional < rules.min_notional) reasons.push(`BELOW_MIN_NOTIONAL ${notional}<${rules.min_notional}`);\n    if (notional > equity * cfg.max_effective_leverage) reasons.push('EFFECTIVE_LEVERAGE_BREACH');\n  }\n\n  // --- Peringatan ----------------------------------------------------------\n  if (Number.isFinite(liqDist) && liqDist < 0.02) {\n    warnings.push(`LIQ_DISTANCE_TINY ${(liqDist * 100).toFixed(3)}% -- ruang stop sempit`);\n  }\n  if (conf < 0.75) warnings.push('MIROFISH_CONFIDENCE_MARGINAL');\n  if (rules.taker_fee > 0.0005) warnings.push('HIGH_TAKER_FEE');\n\n  const approved = reasons.length === 0;\n  return {\n    approved,\n    reasons,\n    warnings,\n    size: approved ? qty : 0,\n    notional: approved ? notional : 0,\n    margin: approved ? Number(sizing.margin || 0) : 0,\n    stop_distance_pct: Number.isFinite(stopDistance) ? stopDistance : 0,\n    liq_distance_pct: Number.isFinite(liqDist) ? liqDist : 0,\n    risk_amount: approved ? Number(sizing.risk_amount || 0) : 0,\n    rr_ratio: rr,\n    ev_per_trade_pct: ev,\n    effective_leverage: approved && equity > 0 ? notional / equity : 0,\n    binding_constraint: sizing.binding_constraint || '',\n  };\n}\n\n// ---------------------------------------------------------------- idempotensi & signing\n\nfunction buildClientOrderId(signalId, symbol, action) {\n  const crypto = require('crypto');\n  const digest = crypto.createHash('sha256').update(`${signalId}|${symbol}|${action}`).digest('hex').slice(0, 24);\n  const act = String(action).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8) || 'ACT';\n  return `pg-${act}-${digest}`.slice(0, 64);\n}\n\nfunction signPionex(method, path, query, body, secret) {\n  const crypto = require('crypto');\n  const joined = Object.keys(query).sort().map((k) => `${k}=${query[k]}`).join('&');\n  const pathUrl = joined ? `${path}?${joined}` : path;\n  let payload = `${method.toUpperCase()}${pathUrl}`;\n  if (method.toUpperCase() === 'POST' || method.toUpperCase() === 'DELETE') payload += body || '';\n  return crypto.createHmac('sha256', secret).update(payload, 'utf8').digest('hex');\n}\n\n// ---------------------------------------------------------------- entry point n8n\n\n\n// Di n8n Code node, tempelkan fungsi-fungsi di atas lalu akhiri dengan blok berikut\n// (module.exports diabaikan oleh n8n, tetapi membuat berkas ini bisa di-require saat uji):\n/*\n  const out = [];\n  for (const item of items) {\n    const { signal, equity, entry, rules, cfg, openPositions, breaker } = item.json;\n    const decision = validateSignal(signal, equity, entry, rules, cfg,\n                                    { openPositions, breaker, now: Date.now() });\n    out.push({ json: { ...decision, signal_id: signal.id || null } });\n  }\n  return out;\n*/\n\n// Mengambil objek JSON pertama dari teks LLM.\n// Regex seperti pola \"buang semua setelah kurung kurawal terakhir\" TIDAK boleh dipakai\n// di sini: pola semacam itu memotong objek valid tepat di kurung kurawal pertama, jadi\n// JSON yang benar justru terbaca sebagai gagal. Yang dipakai adalah pemindaian\n// berbasis kedalaman kurung, yang berhenti hanya bila kurung benar-benar seimbang.\nfunction extractJsonObject(text) {\n  if (typeof text !== 'string') return null;\n  const start = text.indexOf('{');\n  if (start < 0) return null;\n  let depth = 0;\n  let inString = false;\n  let escaped = false;\n  for (let i = start; i < text.length; i += 1) {\n    const c = text[i];\n    if (inString) {\n      if (escaped) escaped = false;\n      else if (c === String.fromCharCode(92)) escaped = true;\n      else if (c === '\"') inString = false;\n      continue;\n    }\n    if (c === '\"') inString = true;\n    else if (c === '{') depth += 1;\n    else if (c === '}') {\n      depth -= 1;\n      if (depth === 0) {\n        try { return JSON.parse(text.slice(start, i + 1)); } catch (e) { return null; }\n      }\n    }\n  }\n  return null;\n}\n\n// ---- entry point n8n: bentuk keluaran LLM menjadi verdict + manifest ---------------\n// Adapter di node berikutnya menuntut bentuk { verdict, manifest, run_id }. Bentuk itu\n// KONTRAK yang sama dengan yang dulu dihasilkan mirofish_runner, sehingga adapter,\n// tabel mirofish_verdict, dan gerbang risiko tidak perlu diubah sama sekali.\nconst j = $json || {};\nconst raw = (j.choices && j.choices[0] && j.choices[0].message\n             && j.choices[0].message.content) || null;\nconst verdict = extractJsonObject(raw);\n\nconst now = new Date().toISOString();\nconst runId = 'n8n-sim-' + Date.now();\nreturn [{ json: {\n  run_id: runId, job_id: runId, job_status: 'SUCCEEDED', created_at: now,\n  verdict: verdict,               // null bila LLM tidak mengembalikan JSON sah\n  summary: null,\n  manifest: { run_id: runId, created_at: now, agen_gagal: j.agen_gagal || 0,\n              jumlah_agen: j.jumlah_agen || 0 },\n} }];\n"
+      },
+      "id": "737a97c1-2976-b6ea-53e8-d6c09d428d51",
+      "name": "Bungkus jadi verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n/code/mirofish_adapter.js\n// Mengubah verdict mentah MiroFish menjadi envelope terstandar yang dibaca gerbang risiko.\n//\n// Prinsip: GAGAL = VETO. Bila apa pun tidak jelas, hasilnya schema_ok=false atau\n// bias='NEUTRAL' -- tidak pernah menebak arah.\n//\n// Input  : { verdict?: {...}, summary?: {...}, manifest?: {...}, job_id?: string }\n// Output : { run_id, verdict_ts, schema_ok, bias, confidence, event_risk,\n//            horizon_hours, evidence, adapter_version, notes[] }\n\nconst ADAPTER_VERSION = '1.0.0';\n\n// Hanya istilah yang hampir pasti tidak muncul sebagai substring kata lain.\n// Kata pendek ('long','short','buy','sell') sengaja TIDAK dipakai: di teks campuran\n// Indonesia/Inggris kata seperti \"naik\" atau \"turun\" bisa muncul di dalam kata lain\n// (\"du-a naik\"? \"me-nurun\") dan menghasilkan bias palsu. Lebih baik NEUTRAL.\nconst LONG_WORDS = ['bullish', 'rally', 'uptrend', 'breakout', 'surge', 'buying pressure'];\nconst SHORT_WORDS = ['bearish', 'selloff', 'sell-off', 'downtrend', 'dump', 'selling pressure'];\n// Bobot ini HARUS identik dengan daftar bobot di mirofish_runner/runner.py.\n// tests/verdict_cases.json dijalankan oleh kedua bahasa; bila salah satu diubah\n// tanpa yang lain, test paritas gagal.\nconst RISK_WORDS = [\n  ['hack', 0.4], ['exploit', 0.4], ['rug pull', 0.4], ['depeg', 0.4],\n  ['insolvent', 0.4], ['insolven', 0.4], ['black swan', 0.45], ['crash', 0.4],\n  ['lawsuit', 0.3], ['gugatan', 0.3], ['delisting', 0.3], ['sanksi', 0.3],\n  ['regulator', 0.25], ['panic', 0.3], ['kepanikan', 0.3], ['ban', 0.3],\n  ['default', 0.3], ['outage', 0.25], ['likuidasi', 0.25], ['pengumuman', 0.2],\n  ['kebijakan', 0.2], ['intervensi', 0.3], ['ketidakpastian', 0.25],\n  ['volatilitas tinggi', 0.3],\n];\nconst LOW_WORDS = ['stable', 'stabil', 'calm', 'tenang', 'normal', 'sideways'];\n\nfunction clamp01(x) {\n  const n = Number(x);\n  if (!Number.isFinite(n)) return 0;\n  return Math.min(1, Math.max(0, n));\n}\n\nfunction textOf(obj) {\n  if (!obj) return '';\n  const parts = [];\n  const walk = (v, depth) => {\n    if (depth > 4 || v == null) return;\n    if (typeof v === 'string') { parts.push(v); return; }\n    if (typeof v === 'number' || typeof v === 'boolean') { parts.push(String(v)); return; }\n    if (Array.isArray(v)) { v.forEach((x) => walk(x, depth + 1)); return; }\n    if (typeof v === 'object') Object.values(v).forEach((x) => walk(x, depth + 1));\n  };\n  walk(obj, 0);\n  return parts.join('\\n');\n}\n\nfunction detectBias(text) {\n  const t = String(text || '').toLowerCase();\n  let longScore = 0;\n  let shortScore = 0;\n  for (const w of LONG_WORDS) if (t.includes(w)) longScore += 1;\n  for (const w of SHORT_WORDS) if (t.includes(w)) shortScore += 1;\n  if (longScore === 0 && shortScore === 0) return 'NEUTRAL';\n  // Ada sinyal dari dua arah = ambigu. Jangan menebak.\n  if (longScore > 0 && shortScore > 0) return 'NEUTRAL';\n  // Satu istilah saja belum cukup untuk menetapkan arah.\n  if (longScore >= 2) return 'LONG';\n  if (shortScore >= 2) return 'SHORT';\n  return 'NEUTRAL';\n}\n\n// Kata kunci pendek (<= 4 huruf, mis. 'ban') hanya dihitung sebagai kata utuh.\n// Tanpa ini 'ban' cocok di dalam 'besar' atau 'banjir' dan verdict tenang terbaca\n// sebagai risiko sedang.\nfunction hitCount(t, w) {\n  if (w.length > 4) return t.includes(w) ? 1 : 0;\n  const re = new RegExp(`(?<![a-z0-9])${w}(?![a-z0-9])`, 'g');\n  return (t.match(re) || []).length > 0 ? 1 : 0;\n}\n\nfunction detectEventRisk(text) {\n  const t = String(text || '').toLowerCase();\n  let score = 0;\n  const hits = [];\n  for (const [w, weight] of RISK_WORDS) {\n    if (hitCount(t, w)) { score += weight; hits.push(w); }\n  }\n  for (const w of LOW_WORDS) {\n    if (hitCount(t, w)) { score -= 0.1; hits.push(`-${w}`); }\n  }\n  score = Math.max(0, Math.min(1, score));\n  const level = score >= 0.66 ? 'HIGH' : score >= 0.33 ? 'MEDIUM' : 'LOW';\n  return { level, score: Math.round(score * 10000) / 10000, hits };\n}\n\nfunction pickConfidence(verdict) {\n  const candidates = [\n    verdict?.confidence,\n    verdict?.confidence_score,\n    verdict?.prediction_confidence,\n    verdict?.score,\n    verdict?.probability,\n    verdict?.summary?.confidence,\n  ];\n  for (const c of candidates) {\n    // HATI-HATI: Number(undefined) === 0 dan Number(null) === 0 di JavaScript.\n    // Tanpa pemeriksaan tipe di bawah, verdict tanpa confidence akan lolos sebagai\n    // \"confidence 0\" -- yaitu persis jenis kegagalan senyap yang harus dicegah.\n    if (typeof c !== 'number' && typeof c !== 'string') continue;\n    if (typeof c === 'string' && c.trim() === '') continue;\n    const n = Number(c);\n    if (Number.isFinite(n) && n >= 0 && n <= 1) return { value: n, source: 'explicit' };\n  }\n  return { value: 0, source: 'missing' };\n}\n\n// Entry point utama. `raw` adalah isi respons GET /jobs/{id}/verdict.\nfunction toEnvelope(raw) {\n  const notes = [];\n  const verdict = raw?.verdict || raw?.data?.verdict || null;\n  const summary = raw?.summary || raw?.data?.summary || null;\n  const manifest = raw?.manifest || raw?.data?.manifest || null;\n  const runId = raw?.run_id || manifest?.run_id || raw?.job_id || null;\n\n  // Timestamp dihitung LEBIH DULU dan ikut dibawa pada jalur veto.\n  // Alasannya konkret: mirofish_verdict.verdict_ts NOT NULL, jadi veto tanpa\n  // timestamp gagal di-INSERT dan jejak auditnya hilang -- kegagalan senyap yang\n  // justru muncul saat ada yang tidak beres.\n  const tsRaw = manifest?.created_at || verdict?.generated_at || verdict?.timestamp\n    || raw?.created_at;\n  let verdictTs = null;\n  if (tsRaw) {\n    const t = Date.parse(String(tsRaw).replace(' ', 'T'));\n    if (!Number.isNaN(t)) verdictTs = new Date(t).toISOString().replace('.000Z', 'Z');\n    else notes.push('UNPARSEABLE_TIMESTAMP');\n  } else {\n    notes.push('TIMESTAMP_MISSING');\n  }\n\n  const base = {\n    run_id: runId,\n    verdict_ts: verdictTs,\n    schema_ok: false,\n    bias: 'NEUTRAL',\n    confidence: null,     // null, bukan 0: \"tidak ada data\" bukan \"confidence nol\"\n    event_risk: 'HIGH',   // default paling konservatif\n    horizon_hours: 24,\n    evidence: [],\n    adapter_version: ADAPTER_VERSION,\n    notes,\n  };\n\n  if (!verdict || typeof verdict !== 'object') {\n    notes.push('VERDICT_MISSING');\n    return base;\n  }\n\n  const prediction = verdict.prediction || verdict.summary || null;\n  if (typeof prediction !== 'string' || prediction.trim().length < 20) {\n    notes.push('PREDICTION_MISSING_OR_TOO_SHORT');\n    return base;\n  }\n\n  const conf = pickConfidence(verdict);\n  if (conf.source === 'missing') {\n    notes.push('CONFIDENCE_MISSING');\n    return base;\n  }\n\n  const riskText = textOf([prediction, verdict.key_dynamics, verdict.signals, summary]);\n  const risk = detectEventRisk(riskText);\n  const bias = detectBias(prediction + '\\n' + textOf(verdict.signals));\n\n  if (!verdictTs) return base;\n\n  return {\n    run_id: runId,\n    verdict_ts: verdictTs,\n    schema_ok: true,\n    bias,\n    confidence: clamp01(conf.value),\n    event_risk: risk.level,\n    risk_score: risk.score,\n    horizon_hours: Number(verdict.horizon_hours || 24),\n    evidence: (verdict.key_dynamics || verdict.signals || []).slice(0, 10),\n    adapter_version: ADAPTER_VERSION,\n    notes: notes.concat(risk.hits.map((h) => `RISK_WORD:${h}`)),\n  };\n}\n\n// ---- entry point n8n: verdict mentah -> envelope terstandar --------------------------\nconst out = [];\nfor (const item of items) {\n  out.push({ json: toEnvelope(item.json) });\n}\nreturn out;\n"
+      },
+      "id": "953c0c2d-4ae4-148b-f0e8-ebd76909041c",
+      "name": "Adapter verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        650,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO mirofish_verdict (run_id, verdict_ts, schema_ok, bias, confidence, event_risk, horizon_hours, risk_score, evidence, adapter_version, raw) VALUES ('{{ $json.run_id }}', '{{ $json.verdict_ts }}', {{ $json.schema_ok }}, '{{ $json.bias }}', {{ $json.confidence }}, '{{ $json.event_risk }}', {{ $json.horizon_hours }}, {{ $json.risk_score === undefined || $json.risk_score === null ? 1 : $json.risk_score }}, '{{ JSON.stringify($json.evidence) }}'::jsonb, '{{ $json.adapter_version }}', '{{ JSON.stringify($json) }}'::jsonb) ON CONFLICT (run_id) DO NOTHING;",
+        "options": {}
+      },
+      "id": "9a30aec9-dc4b-041f-eedf-ffca4a053029",
+      "name": "Simpan verdict",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        900,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.event_risk }}",
+              "rightValue": "HIGH",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fcd27668-9cc3-59da-4865-918f722a1785",
+      "name": "Veto?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1150,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $env.ALERT_EMAIL }}",
+        "subject": "=Pionex Guard: {{ $json.reason || $json.problems || 'alert' }}",
+        "text": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "e9007f7e-bdd9-e0ab-7d85-6c36f85a8cfb",
+      "name": "Notifikasi veto",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1400,
+        140
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - SMTP"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Setiap 2 jam": {
+      "main": [
+        [
+          {
+            "node": "Baca cache riset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Baca cache riset": {
+      "main": [
+        [
+          {
+            "node": "Bangun panggilan agen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bangun panggilan agen": {
+      "main": [
+        [
+          {
+            "node": "LLM paralel (5 agen)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM paralel (5 agen)": {
+      "main": [
+        [
+          {
+            "node": "Simpulkan pendapat agen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simpulkan pendapat agen": {
+      "main": [
+        [
+          {
+            "node": "LLM sintesis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM sintesis": {
+      "main": [
+        [
+          {
+            "node": "Bungkus jadi verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bungkus jadi verdict": {
+      "main": [
+        [
+          {
+            "node": "Adapter verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adapter verdict": {
+      "main": [
+        [
+          {
+            "node": "Simpan verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simpan verdict": {
+      "main": [
+        [
+          {
+            "node": "Veto?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Veto?": {
+      "main": [
+        [
+          {
+            "node": "Notifikasi veto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveExecutionProgress": true
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "pionex-guard-50x"
+    }
+  ]
+}

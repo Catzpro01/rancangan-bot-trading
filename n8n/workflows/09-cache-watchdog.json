@@ -1,0 +1,191 @@
+{
+  "name": "Pionex Guard \u2014 09 Penjaga Cache",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "8d80963f-f17d-55c7-d5d2-f35f1a45f689",
+      "name": "Setiap 10 menit",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -900,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "pg:research:latest",
+        "propertyName": "cache",
+        "keyType": "automatic",
+        "options": {}
+      },
+      "name": "Baca cache riset",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        -600,
+        0
+      ],
+      "credentials": {
+        "redis": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Redis"
+        }
+      },
+      "id": "b0fa9e02-33f7-e40b-5d37-6678e5cecfa3"
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "set-0",
+              "name": "age_sec",
+              "value": "={{ $json.cache && $json.cache.collected_at ? (Date.now() - Date.parse($json.cache.collected_at)) / 1000 : 999999 }}",
+              "type": "string"
+            },
+            {
+              "id": "set-1",
+              "name": "collected_at",
+              "value": "={{ $json.cache ? $json.cache.collected_at : null }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Hitung umur",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -350,
+        0
+      ],
+      "id": "a3091e1e-2b79-7292-f08e-baa748f772a1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.age_sec }}",
+              "rightValue": 3600,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "83158a18-5e2a-550b-1021-b4458ad46f91",
+      "name": "Basi?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $env.ALERT_EMAIL }}",
+        "subject": "=Pionex Guard: {{ $json.reason || $json.problems || 'alert' }}",
+        "text": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "5772e455-385e-7cac-79dd-8ebc4468aa33",
+      "name": "Notifikasi cache basi",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        200,
+        140
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - SMTP"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Setiap 10 menit": {
+      "main": [
+        [
+          {
+            "node": "Baca cache riset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Baca cache riset": {
+      "main": [
+        [
+          {
+            "node": "Hitung umur",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hitung umur": {
+      "main": [
+        [
+          {
+            "node": "Basi?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basi?": {
+      "main": [
+        [
+          {
+            "node": "Notifikasi cache basi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveExecutionProgress": true
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "pionex-guard-50x"
+    }
+  ]
+}

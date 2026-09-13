@@ -483,6 +483,109 @@ def notify(name: str, position=(700, 200)) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Node asli n8n. Dipakai sebanyak mungkin agar jumlah Code node tetap sedikit:
+# semakin banyak kode yang ditulis tangan, semakin banyak tempat untuk salah.
+# ---------------------------------------------------------------------------
+
+
+def redis_set(name: str, key: str, value: str, ttl: int | None = None,
+              position=(0, 0)) -> dict:
+    params: dict = {"operation": "set", "key": key, "value": value,
+                    "keyType": "automatic", "options": {}}
+    if ttl:
+        params["options"] = {"expire": True, "ttl": ttl}
+    return {"parameters": params, "name": name, "type": "n8n-nodes-base.redis",
+            "typeVersion": 1, "position": list(position),
+            "credentials": {"redis": {"id": "REPLACE_ME", "name": "Pionex Guard - Redis"}}}
+
+
+def redis_get(name: str, key: str, prop: str = "cache", position=(0, 0)) -> dict:
+    return {"parameters": {"operation": "get", "key": key, "propertyName": prop,
+                           "keyType": "automatic", "options": {}},
+            "name": name, "type": "n8n-nodes-base.redis", "typeVersion": 1,
+            "position": list(position),
+            "credentials": {"redis": {"id": "REPLACE_ME", "name": "Pionex Guard - Redis"}}}
+
+
+def rss(name: str, url: str, position=(0, 0)) -> dict:
+    return {"parameters": {"url": url, "options": {}}, "name": name,
+            "type": "n8n-nodes-base.rssFeedRead", "typeVersion": 1,
+            "position": list(position), "onError": "continueRegularOutput"}
+
+
+def aggregate(name: str, field: str = "", out_field: str = "data",
+              position=(0, 0)) -> dict:
+    params: dict = {"aggregate": "aggregateAllItemData", "options": {}}
+    if field:
+        params = {"aggregate": "aggregateIndividualFields",
+                  "fieldsToAggregate": {"fieldToAggregate": [{"field": field}]},
+                  "options": {}}
+    params["outputField"] = out_field if out_field != "data" else params.get("outputField", "data")
+    return {"parameters": params, "name": name, "type": "n8n-nodes-base.aggregate",
+            "typeVersion": 1, "position": list(position)}
+
+
+def set_fields(name: str, assignments: list[tuple[str, str]], position=(0, 0)) -> dict:
+    return {"parameters": {
+                "mode": "manual",
+                "duplicateItem": False,
+                "assignments": {"assignments": [
+                    {"id": f"set-{i}", "name": k, "value": v,
+                     "type": "string"} for i, (k, v) in enumerate(assignments)]},
+                "options": {}},
+            "name": name, "type": "n8n-nodes-base.set", "typeVersion": 3.4,
+            "position": list(position)}
+
+
+def limit_node(name: str, count: int, position=(0, 0)) -> dict:
+    return {"parameters": {"maxItems": count}, "name": name,
+            "type": "n8n-nodes-base.limit", "typeVersion": 1,
+            "position": list(position)}
+
+
+def dedupe(name: str, field: str, position=(0, 0)) -> dict:
+    return {"parameters": {
+                "operation": "removeDuplicates",
+                "compare": "selectedFields",
+                "fieldsToCompare": {"fields": [{"fieldName": field}]},
+                "options": {}},
+            "name": name, "type": "n8n-nodes-base.removeDuplicates",
+            "typeVersion": 2, "position": list(position)}
+
+
+def sort_node(name: str, field: str, position=(0, 0)) -> dict:
+    return {"parameters": {
+                "sortFieldsUi": {"sortField": [
+                    {"fieldName": field, "order": "descending"}]}},
+            "name": name, "type": "n8n-nodes-base.sort", "typeVersion": 1,
+            "position": list(position)}
+
+
+def merge_node(name: str, mode: str = "combine", position=(0, 0)) -> dict:
+    params: dict = {"mode": mode, "options": {}}
+    if mode == "combine":
+        params["combineBy"] = "combineByPosition"
+    return {"parameters": params, "name": name, "type": "n8n-nodes-base.merge",
+            "typeVersion": 3, "position": list(position)}
+
+
+def filter_node(name: str, conditions: list[dict], position=(0, 0)) -> dict:
+    return {"parameters": {
+                "conditions": {"options": {"caseSensitive": True,
+                                           "typeValidation": "loose", "version": 2},
+                               "conditions": conditions, "combinator": "and"},
+                "options": {}},
+            "name": name, "type": "n8n-nodes-base.filter", "typeVersion": 2.2,
+            "position": list(position)}
+
+
+def wait_node(name: str, seconds: int, position=(0, 0)) -> dict:
+    return {"parameters": {"amount": seconds, "unit": "seconds"}, "name": name,
+            "type": "n8n-nodes-base.wait", "typeVersion": 1.1,
+            "position": list(position), "webhookId": ""}
+
+
 BASE = "https://api.pionex.com"
 
 # Template URL untuk HTTP Request node. PENTING: URL, timestamp, dan tanda tangan
@@ -981,6 +1084,351 @@ return [{ json: {
 # --------------------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------------------
+# 7. Riset pasar & cache  —  node asli n8n saja, NOL Code node
+# --------------------------------------------------------------------------------------
+
+GDELT_TONE = ("https://api.gdeltproject.org/api/v2/doc/doc?query=%22bitcoin%22%20OR%20"
+              "%22crypto%22&mode=TimelineTone&format=json&timespan=7d")
+GDELT_VOL = ("https://api.gdeltproject.org/api/v2/doc/doc?query=%22bitcoin%22%20OR%20"
+             "%22crypto%22&mode=TimelineVol&format=json&timespan=7d")
+GDELT_NEG = ("https://api.gdeltproject.org/api/v2/doc/doc?query=bitcoin%20tone%3C-5"
+             "&mode=ArtList&format=json&maxrecords=25&sort=DateDesc&timespan=2d")
+FNG = "https://api.alternative.me/fng/?limit=14"
+STABLE_FLOW = "https://stablecoins.llama.fi/stablecoincharts/all?stablecoin=1"
+
+
+def build_research() -> dict:
+    """Kumpulkan intelijen pasar -> simpan sebagai satu dokumen di cache KV.
+
+    NOL Code node. Urutannya penting: tiap cabang menamai field-nya lebih dulu lewat
+    Edit Fields, baru semuanya digabung satu node Merge. Tanpa penamaan itu, Merge
+    akan menumpuk enam item terpisah dan dokumen induknya kosong -- kesalahan yang
+    tidak menimbulkan error, hanya data yang hilang diam-diam.
+    """
+    f = Flow("Pionex Guard — 07 Riset Pasar & Cache")
+    f.add(schedule("Setiap 15 menit", {"field": "minutes", "minutesInterval": 15}))
+    sym = "{{ $env.PIONEX_SYMBOL }}"
+
+    # --- 1. nada berita global (GDELT TimelineTone: rata-rata sentimen per hari) ---
+    f.add(http("GDELT nada berita", "GET", GDELT_TONE, (-900, -300)))
+    f.add(set_fields("Beri nama: tone", [("tone", "={{ $json }}")], (-700, -300)))
+    f.add(redis_set("Cache nada berita", "pg:research:tone",
+                    "={{ JSON.stringify($json.tone) }}", 3600, (-500, -300)))
+
+    # --- 2. volume berita (untuk mendeteksi lonjakan pemberitaan) ---
+    f.add(http("GDELT volume berita", "GET", GDELT_VOL, (-900, -180)))
+    f.add(set_fields("Beri nama: volume", [("volume", "={{ $json }}")], (-700, -180)))
+    f.add(redis_set("Cache volume berita", "pg:research:volume",
+                    "={{ JSON.stringify($json.volume) }}", 3600, (-500, -180)))
+
+    # --- 3. berita bernada paling negatif 2 hari terakhir ---
+    f.add(http("GDELT berita negatif", "GET", GDELT_NEG, (-900, -60)))
+    f.add(limit_node("Batasi 15 berita", 15, (-760, -60)))
+    f.add(set_fields("Beri nama: negative", [("negative", "={{ $json.articles || [] }}")],
+                     (-560, -60)))
+    f.add(redis_set("Cache berita negatif", "pg:research:negative",
+                    "={{ JSON.stringify($json.negative) }}", 3600, (-360, -60)))
+
+    # --- 4. Fear & Greed 14 hari ---
+    f.add(http("Fear & Greed", "GET", FNG, (-900, 60)))
+    f.add(set_fields("Beri nama: fear_greed", [("fear_greed", "={{ $json.data || [] }}")],
+                     (-700, 60)))
+    f.add(redis_set("Cache fear greed", "pg:research:fear_greed",
+                    "={{ JSON.stringify($json.fear_greed) }}", 3600, (-500, 60)))
+
+    # --- 5. aliran stablecoin: proksi likuiditas masuk/keluar kripto ---
+    # Payload mentahnya ratusan KB, jadi diambil 30 titik terakhir saja.
+    f.add(http("Aliran stablecoin", "GET", STABLE_FLOW, (-900, 180)))
+    f.add(aggregate("Rangkai deret stablecoin", "", "series", (-760, 180)))
+    f.add(set_fields("Ambil 30 hari terakhir",
+                     [("stablecoin", "={{ ($json.series || []).slice(-30) }}")],
+                     (-560, 180)))
+    f.add(redis_set("Cache aliran stablecoin", "pg:research:stablecoin",
+                    "={{ JSON.stringify($json.stablecoin) }}", 3600, (-360, 180)))
+
+    # --- 6. funding & indeks dari bursa ---
+    f.add(http("Funding & indeks", "GET",
+               f"{BASE}/api/v1/market/indexes?symbol={sym}", (-900, 300)))
+    f.add(set_fields("Beri nama: funding", [("funding", "={{ $json }}")], (-700, 300)))
+    f.add(redis_set("Cache funding", "pg:research:funding",
+                    "={{ JSON.stringify($json.funding) }}", 900, (-500, 300)))
+
+    # --- gabung enam cabang menjadi SATU item berisi enam field bernama ---
+    f.add(merge_node("Gabung semua sumber", "combine", (0, 0)))
+    f.add(set_fields("Dokumen riset", [
+        ("symbol", "={{ $env.PIONEX_SYMBOL }}"),
+        ("collected_at", "={{ new Date().toISOString() }}"),
+    ], (220, 0)))
+    f.add(redis_set("Cache induk (kv)", "pg:research:latest",
+                    "={{ JSON.stringify($json) }}", 7200, (440, 0)))
+
+    for src in ("GDELT nada berita", "GDELT volume berita", "GDELT berita negatif",
+                "Fear & Greed", "Aliran stablecoin", "Funding & indeks"):
+        f.link("Setiap 15 menit", src)
+    f.link("GDELT nada berita", "Beri nama: tone")
+    f.link("Beri nama: tone", "Cache nada berita")
+    f.link("GDELT volume berita", "Beri nama: volume")
+    f.link("Beri nama: volume", "Cache volume berita")
+    f.link("GDELT berita negatif", "Batasi 15 berita")
+    f.link("Batasi 15 berita", "Beri nama: negative")
+    f.link("Beri nama: negative", "Cache berita negatif")
+    f.link("Fear & Greed", "Beri nama: fear_greed")
+    f.link("Beri nama: fear_greed", "Cache fear greed")
+    f.link("Aliran stablecoin", "Rangkai deret stablecoin")
+    f.link("Rangkai deret stablecoin", "Ambil 30 hari terakhir")
+    f.link("Ambil 30 hari terakhir", "Cache aliran stablecoin")
+    f.link("Funding & indeks", "Beri nama: funding")
+    f.link("Beri nama: funding", "Cache funding")
+    for src in ("Cache nada berita", "Cache volume berita", "Cache berita negatif",
+                "Cache fear greed", "Cache aliran stablecoin", "Cache funding"):
+        f.link(src, "Gabung semua sumber")
+    f.link("Gabung semua sumber", "Dokumen riset")
+    f.link("Dokumen riset", "Cache induk (kv)")
+    return f.json()
+
+
+# --------------------------------------------------------------------------------------
+# 8. Simulasi agen pasar (gaya MiroFish) — satu-satunya bagian yang memakai LLM
+# --------------------------------------------------------------------------------------
+
+AGENTS = [
+    ("makro",
+     "Analis makro. Anda hanya peduli pada likuiditas global, kebijakan bank sentral, "
+     "data inflasi, dan aliran stablecoin. Abaikan grafik harga."),
+    ("arus_modal",
+     "Analis aliran modal. Anda membaca Fear & Greed, pasokan stablecoin, dan funding "
+     "rate untuk menyimpulkan apakah uang sedang masuk atau keluar dari kripto."),
+    ("risiko_ekstrem",
+     "Analis risiko peristiwa. Tugas Anda HANYA mencari hal yang bisa mengguncang harga "
+     "tiba-tiba: peretasan, kebangkrutan, tindakan regulator, depeg, gangguan bursa. "
+     "Bila tidak ada, katakan tidak ada. Jangan mengarang risiko."),
+    ("kontrarian",
+     "Anda wajib berargumen melawan konsensus. Bila semua sinyal bullish, jelaskan "
+     "kenapa itu bisa salah. Bila bearish, jelaskan sisi sebaliknya. Tugas Anda "
+     "menguji, bukan menyenangkan."),
+    ("mikrostruktur",
+     "Analis mikrostruktur pasar. Anda membaca funding rate dan volatilitas untuk "
+     "menyimpulkan apakah posisi pasar sudah terlalu padat ke satu arah."),
+]
+
+ENTRY_BUILD_AGENT_CALLS = """
+// ---- entry point n8n: bangun satu panggilan LLM per agen ---------------------------
+// Code node karena tidak ada node asli yang bisa merangkai daftar peran menjadi
+// beberapa item dengan prompt berbeda. Selebihnya aliran ini memakai node asli.
+//
+// PENTING: di mode "Run Once for All Items", $json TIDAK dijamin terisi. Membaca
+// $json di sini menghasilkan {} dan seluruh konteks pasar hilang tanpa error --
+// prompt terkirim kosong dan para agen menjawab dari imajinasi. Karena itu masukan
+// selalu diambil dari `items` secara eksplisit.
+const cache = (items[0] && items[0].json && items[0].json.cache) || {};
+const context = JSON.stringify({
+  symbol: cache.symbol || $env.PIONEX_SYMBOL,
+  collected_at: cache.collected_at || null,
+  fear_greed: cache.fear_greed || null,
+  tone_berita: cache.tone || null,
+  volume_berita: cache.volume || null,
+  berita_negatif: (cache.negative || []).slice(0, 15),
+  aliran_stablecoin: cache.stablecoin || null,
+  funding: cache.funding || null,
+});
+
+const AGENTS = __AGENTS__;
+const model = $env.LLM_MODEL || 'gpt-4o-mini';
+
+return AGENTS.map((pair) => ({ json: {
+  agent: pair[0],
+  body: JSON.stringify({
+    model,
+    temperature: 0.2,
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content:
+          'Anda adalah ' + pair[1] + ' Jawab HANYA dalam JSON dengan kunci: '
+        + '"stance" (LONG|SHORT|NEUTRAL), "confidence" (0 sampai 1), '
+        + '"event_risk" (LOW|MEDIUM|HIGH), "alasan" (maks 2 kalimat), '
+        + '"bukti" (array string, sebutkan angka atau judul berita yang Anda pakai). '
+        + 'Bila data tidak cukup, gunakan confidence rendah dan stance NEUTRAL. '
+        + 'Jangan mengarang data yang tidak ada di konteks.' },
+      { role: 'user', content: context },
+    ],
+  }),
+} }));
+"""
+
+EXTRACT_JSON_HELPER = """
+// Mengambil objek JSON pertama dari teks LLM.
+// Regex seperti pola "buang semua setelah kurung kurawal terakhir" TIDAK boleh dipakai
+// di sini: pola semacam itu memotong objek valid tepat di kurung kurawal pertama, jadi
+// JSON yang benar justru terbaca sebagai gagal. Yang dipakai adalah pemindaian
+// berbasis kedalaman kurung, yang berhenti hanya bila kurung benar-benar seimbang.
+function extractJsonObject(text) {
+  if (typeof text !== 'string') return null;
+  const start = text.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const c = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === String.fromCharCode(92)) escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') inString = true;
+    else if (c === '{') depth += 1;
+    else if (c === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        try { return JSON.parse(text.slice(start, i + 1)); } catch (e) { return null; }
+      }
+    }
+  }
+  return null;
+}
+"""
+
+
+ENTRY_SYNTHESIZE = """
+// ---- entry point n8n: simpulkan pendapat para agen --------------------------------
+// Code node ini melakukan dua hal yang tidak bisa dilakukan node asli:
+//   1. menggabungkan N jawaban agen menjadi satu konteks,
+//   2. mem-PARSE JSON keluaran LLM. Parser ini sengaja ketat: LLM bisa membalas teks
+//      di luar JSON, dan aturan sistem ini adalah "gagal = veto", bukan "tebak".
+const model = $env.LLM_MODEL || 'gpt-4o-mini';
+const opinions = [];
+for (const item of items) {
+  const j = item.json || {};
+  const raw = (j.choices && j.choices[0] && j.choices[0].message
+               && j.choices[0].message.content) || null;
+  const parsed = extractJsonObject(raw);
+  opinions.push({ agen: j.agent || 'tidak_diketahui', mentah: raw || null, parsed });
+
+}
+
+const gagal = opinions.filter((o) => !o.parsed).length;
+
+const body = JSON.stringify({
+  model,
+  temperature: 0.1,
+  response_format: { type: 'json_object' },
+  messages: [
+    { role: 'system', content:
+        'Anda menyimpulkan diskusi beberapa analis. Jawab HANYA dalam JSON dengan kunci: '
+      + '"prediction" (minimal 20 kata, ringkasan kesimpulan), "confidence" (0 sampai 1), '
+      + '"event_risk" (LOW|MEDIUM|HIGH), "key_dynamics" (array string), '
+      + '"signals" (array string). Aturan keras: bila analis tidak sepakat, confidence '
+      + 'harus di bawah 0.6 dan event_risk tidak boleh LOW. Bila ada satu saja analis '
+      + 'menyebut risiko peristiwa konkret, event_risk minimal MEDIUM. '
+      + 'Confidence maksimum 0.85: Anda menyimpulkan opini, bukan mengukur probabilitas.' },
+    { role: 'user', content: JSON.stringify({ jumlah_agen: opinions.length,
+                                              agen_gagal: gagal, pendapat: opinions }) },
+  ],
+});
+
+return [{ json: { agent: 'sintesis', agen_gagal: gagal,
+                  jumlah_agen: opinions.length, body } }];
+"""
+
+ENTRY_WRAP_VERDICT = """
+// ---- entry point n8n: bentuk keluaran LLM menjadi verdict + manifest ---------------
+// Adapter di node berikutnya menuntut bentuk { verdict, manifest, run_id }. Bentuk itu
+// KONTRAK yang sama dengan yang dulu dihasilkan mirofish_runner, sehingga adapter,
+// tabel mirofish_verdict, dan gerbang risiko tidak perlu diubah sama sekali.
+const j = $json || {};
+const raw = (j.choices && j.choices[0] && j.choices[0].message
+             && j.choices[0].message.content) || null;
+const verdict = extractJsonObject(raw);
+
+const now = new Date().toISOString();
+const runId = 'n8n-sim-' + Date.now();
+return [{ json: {
+  run_id: runId, job_id: runId, job_status: 'SUCCEEDED', created_at: now,
+  verdict: verdict,               // null bila LLM tidak mengembalikan JSON sah
+  summary: null,
+  manifest: { run_id: runId, created_at: now, agen_gagal: j.agen_gagal || 0,
+              jumlah_agen: j.jumlah_agen || 0 },
+} }];
+"""
+
+
+def build_simulation() -> dict:
+    f = Flow("Pionex Guard — 08 Simulasi Agen Pasar")
+    f.add(schedule("Setiap 2 jam", {"field": "hours", "hoursInterval": 2}))
+
+    f.add(redis_get("Baca cache riset", "pg:research:latest", "cache", (-800, 0)))
+    agents_literal = "[" + ", ".join(
+        "[" + json.dumps(a) + ", " + json.dumps(b) + "]" for a, b in AGENTS) + "]"
+    f.add(code("Bangun panggilan agen",
+               guard_body(ENTRY_BUILD_AGENT_CALLS.replace("__AGENTS__", agents_literal)),
+               (-600, 0)))
+    f.add(http("LLM paralel (5 agen)", "POST",
+               "={{ $env.LLM_API_BASE }}/chat/completions", (-350, 0),
+               body="={{ $json.body }}",
+               headers={"Authorization": "=Bearer {{ $env.LLM_API_KEY }}",
+                        "Content-Type": "application/json"}))
+    f.add(code("Simpulkan pendapat agen",
+               guard_body(EXTRACT_JSON_HELPER + ENTRY_SYNTHESIZE), (-100, 0)))
+    f.add(http("LLM sintesis", "POST",
+               "={{ $env.LLM_API_BASE }}/chat/completions", (150, 0),
+               body="={{ $json.body }}",
+               headers={"Authorization": "=Bearer {{ $env.LLM_API_KEY }}",
+                        "Content-Type": "application/json"}))
+    f.add(code("Bungkus jadi verdict",
+               guard_body(EXTRACT_JSON_HELPER + ENTRY_WRAP_VERDICT), (400, 0)))
+    f.add(code("Adapter verdict", adapter_body(), (650, 0)))
+    f.add(postgres("Simpan verdict", "executeQuery",
+                   "INSERT INTO mirofish_verdict (run_id, verdict_ts, schema_ok, bias, confidence, "
+                   "event_risk, horizon_hours, risk_score, evidence, adapter_version, raw) "
+                   "VALUES ('{{ $json.run_id }}', '{{ $json.verdict_ts }}', {{ $json.schema_ok }}, "
+                   "'{{ $json.bias }}', {{ $json.confidence }}, '{{ $json.event_risk }}', "
+                   "{{ $json.horizon_hours }}, "
+                   "{{ $json.risk_score === undefined || $json.risk_score === null ? 1 : $json.risk_score }}, "
+                   "'{{ JSON.stringify($json.evidence) }}'::jsonb, "
+                   "'{{ $json.adapter_version }}', '{{ JSON.stringify($json) }}'::jsonb) "
+                   "ON CONFLICT (run_id) DO NOTHING;", (900, 0)))
+    f.add(if_node("Veto?", [cond("={{ $json.event_risk }}", "equals", "HIGH")], (1150, 0)))
+    f.add(notify("Notifikasi veto", (1400, 140)))
+
+    f.link("Setiap 2 jam", "Baca cache riset")
+    f.link("Baca cache riset", "Bangun panggilan agen")
+    f.link("Bangun panggilan agen", "LLM paralel (5 agen)")
+    f.link("LLM paralel (5 agen)", "Simpulkan pendapat agen")
+    f.link("Simpulkan pendapat agen", "LLM sintesis")
+    f.link("LLM sintesis", "Bungkus jadi verdict")
+    f.link("Bungkus jadi verdict", "Adapter verdict")
+    f.link("Adapter verdict", "Simpan verdict")
+    f.link("Simpan verdict", "Veto?")
+    f.link("Veto?", "Notifikasi veto", "main", 0)
+    return f.json()
+
+
+# --------------------------------------------------------------------------------------
+# 9. Penjaga kesegaran cache
+# --------------------------------------------------------------------------------------
+
+
+def build_cache_watchdog() -> dict:
+    f = Flow("Pionex Guard — 09 Penjaga Cache")
+    f.add(schedule("Setiap 10 menit", {"field": "minutes", "minutesInterval": 10}))
+    f.add(redis_get("Baca cache riset", "pg:research:latest", "cache", (-600, 0)))
+    f.add(set_fields("Hitung umur", [
+        ("age_sec", "={{ $json.cache && $json.cache.collected_at "
+                    "? (Date.now() - Date.parse($json.cache.collected_at)) / 1000 : 999999 }}"),
+        ("collected_at", "={{ $json.cache ? $json.cache.collected_at : null }}"),
+    ], (-350, 0)))
+    f.add(if_node("Basi?", [cond("={{ $json.age_sec }}", "gt", 3600)], (-100, 0)))
+    f.add(notify("Notifikasi cache basi", (200, 140)))
+
+    f.link("Setiap 10 menit", "Baca cache riset")
+    f.link("Baca cache riset", "Hitung umur")
+    f.link("Hitung umur", "Basi?")
+    f.link("Basi?", "Notifikasi cache basi", "main", 0)
+    return f.json()
+
+
 def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     builders = [
@@ -990,6 +1438,9 @@ def main() -> int:
         ("04-position-monitor.json", build_monitor),
         ("05-kill-switch.json", build_killswitch),
         ("06-mirofish-sweep.json", build_mirofish),
+        ("07-market-research-cache.json", build_research),
+        ("08-market-intel-simulation.json", build_simulation),
+        ("09-cache-watchdog.json", build_cache_watchdog),
     ]
     for fname, fn in builders:
         path = OUT / fname
