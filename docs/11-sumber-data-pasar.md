@@ -23,7 +23,7 @@ tidak akan berpura-pura ada.
 
 | Sumber | Endpoint | Biaya | Verifikasi |
 |---|---|---|---|
-| **GDELT DOC 2.0** | `api.gdeltproject.org/api/v2/doc/doc` | Gratis, **tanpa kunci API** | ✅ Saya panggil `?query=bitcoin&mode=ArtList&format=json&timespan=1d` dan menerima 3 artikel nyata bertanggal `20260912T220000Z` dengan judul, domain, bahasa, dan negara sumber |
+| **GDELT DOC 2.0** | `api.gdeltproject.org/api/v2/doc/doc` | Gratis, **tanpa kunci API** | ✅ `mode=TimelineTone` mengembalikan deret nada **per jam** sampai `20260913T090000Z` (hari ini); `mode=ArtList&timespan=1d` mengembalikan 3 artikel nyata bertanggal `20260912T220000Z` |
 | **Fear & Greed Index** | `api.alternative.me/fng/?limit=14` | Gratis, tanpa kunci | ✅ Mengembalikan `value: "61", value_classification: "Greed"` beserta stempel waktu |
 | **Aliran stablecoin** | `stablecoins.llama.fi/stablecoincharts/all?stablecoin=1` | Gratis, tanpa kunci | ✅ Mengembalikan deret harian USDT (`circulating`, `circulatingPrevDay`, `circulatingPrevWeek`) |
 | **Funding & indeks** | `api.pionex.com/api/v1/market/indexes` | Gratis (publik) | ✅ Endpoint yang sama sudah dipakai workflow `02` |
@@ -36,9 +36,21 @@ Mode GDELT yang dipakai workflow `07`:
 
 ## 3. Batasan tiap sumber — baca sebelum percaya
 
-**GDELT**
-- Dibatasi **1 permintaan per 5 detik**; lebih dari itu dibalas HTTP 429. Workflow `07`
-  hanya memanggil 3 kali per 15 menit, jadi aman.
+**GDELT** — tiga jebakan yang saya temukan dengan memanggilnya langsung:
+
+- **Query dengan `OR` wajib dibungkus tanda kurung.** Tanpa kurung, GDELT membalas
+  `Queries containing OR'd terms must be surrounded by ().` — dan membalasnya dengan
+  **HTTP 200**, bukan kode kesalahan. Query yang benar:
+  `?query=%28bitcoin%20OR%20crypto%29&mode=TimelineTone&format=json&timespan=7d`.
+  Bentuk tanpa kurung adalah bug yang *permanen*, bukan sesekali.
+- **Teguran batas laju juga dikirim sebagai HTTP 200 + teks polos**, bukan HTTP 429:
+  `Please limit requests to one every 5 seconds...`. Node HTTP n8n akan menganggapnya
+  sukses, lalu teks itu masuk ke cache dan dikirim ke agen LLM sebagai "data nada
+  berita". Karena itu workflow `07` memasang `Wait` 6 detik antar panggilan GDELT
+  **dan** satu Code node penjaga yang menolak respons yang tidak punya `timeline`
+  atau `articles`.
+- Dibatasi **1 permintaan per 5 detik**. Tiga panggilan sekaligus berarti dua di
+  antaranya pasti gagal.
 - Jendela data **3 bulan bergulir**. Tidak bisa untuk riset historis panjang.
 - **Tidak memberi isi artikel** — hanya judul, URL, domain, negara, bahasa. Jadi
   "intelijen" yang masuk ke simulasi agen adalah *judul dan nada*, bukan analisis
@@ -118,3 +130,38 @@ kunci punya TTL (15 menit–2 jam) dan workflow `09` memeriksa umur dokumen indu
 - Confidence yang dihasilkan simulasi adalah **opini model bahasa**, bukan probabilitas
   terukur. Karena itu perannya tetap veto, dan `docs/04` membatasi confidence maksimum
   yang bisa memengaruhi keputusan.
+
+## 8. Menguji rantai LLM tanpa LLM
+
+`tools/mock_llm_server.py` adalah server tiruan yang meniru `POST /chat/completions`
+ala OpenAI. Ia tidak meniru kecerdasan model bahasa — itu tidak mungkin dan tidak
+perlu — melainkan **bentuk percakapannya**, sehingga kode yang mengirim permintaan dan
+mem-parse jawaban bisa diuji apa adanya: 401 tanpa Bearer, 400 untuk badan rusak, dan
+`choices[0].message.content` berupa JSON bila prompt menuntutnya.
+
+`tests/test_simulation_integration.js` (13 test) menjalankannya dan menguji **rantai
+penuh** workflow 08: bangun panggilan agen → HTTP nyata → parse → sintesis → HTTP
+nyata → bungkus → adapter. Termasuk jalur gagalnya: LLM menjawab teks bebas, JSON
+terpotong, `content` null, server mati, dan cache kosong — semuanya harus berakhir
+dengan **veto**, bukan terkaan.
+
+Jalankan sendiri:
+
+```bash
+node --test tests/test_simulation_integration.js
+```
+
+Dua pelajaran yang hanya muncul dari uji ujung-ke-ujung ini:
+
+1. **Aturan keselamatan tidak boleh hidup di prompt.** Aturan "bila ada satu agen
+   menyebut risiko peristiwa, event_risk tidak boleh LOW" awalnya hanya tertulis di
+   prompt sintesis. Pada uji dengan berita exploit, agen risiko menjawab HIGH tetapi
+   sintesis menurunkannya jadi MEDIUM karena empat agen lain menjawab LOW. Lantainya
+   sekarang dihitung di kode dan ditegakkan di node pembungkus.
+2. **Adapter mengabaikan `verdict.event_risk`.** Ia menghitung risiko dari pemindaian
+   kata kunci di teks. Sisi baiknya, LLM tidak bisa menurunkan risiko hanya dengan
+   menulis "LOW". Sisi buruknya, risiko yang dilaporkan agen ikut terbuang. Sekarang
+   kedua bukti dipakai dan **yang paling konservatif yang menang**; penaikannya
+   dicatat sebagai `EVENT_RISK_DINYATAKAN:<tingkat>` di kolom `notes`.
+
+Server tiruan ini **bukan bagian dari runtime bot**. Ia hanya alat uji.

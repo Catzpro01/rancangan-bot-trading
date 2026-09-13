@@ -514,12 +514,16 @@ test('monitor menggabungkan posisi bursa dengan state DB per posisi', async () =
 // Workflow 07/08/09: riset pasar -> cache KV -> simulasi agen -> verdict
 // ---------------------------------------------------------------------------
 
-test('workflow 07 memakai node asli n8n saja, tanpa Code node', () => {
+test('workflow 07 hanya memakai Code node untuk penjaga GDELT', () => {
   const wf = loadWorkflow('07-market-research-cache.json');
   const jenis = {};
   for (const n of wf.nodes) jenis[n.type] = (jenis[n.type] || 0) + 1;
-  assert.strictEqual(jenis['n8n-nodes-base.code'], undefined,
-    'workflow riset tidak boleh punya Code node');
+  // Pengecualian SEMPIT: GDELT menolak permintaan dengan HTTP 200 + teks polos, jadi
+  // hanya Code node yang bisa membedakan data dari teguran. Code node lain tetap salah.
+  const IZIN = ['Sah: nada berita', 'Sah: volume berita', 'Sah: berita negatif'];
+  const codes = wf.nodes.filter((n) => n.type === 'n8n-nodes-base.code').map((n) => n.name);
+  assert.deepStrictEqual(codes.sort(), IZIN.slice().sort(),
+    'Code node di workflow riset hanya boleh tiga penjaga GDELT');
   assert.ok(jenis['n8n-nodes-base.redis'] >= 7, 'harus menulis tiap sumber ke cache');
   assert.ok(jenis['n8n-nodes-base.merge'] >= 1, 'butuh Merge untuk menggabungkan cabang');
   assert.ok(jenis['n8n-nodes-base.set'] >= 6, 'tiap cabang harus menamai field-nya');

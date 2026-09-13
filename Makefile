@@ -2,7 +2,7 @@ PY ?= python3
 
 .PHONY: test test-py test-js workflows validate vectors simulate clean
 
-test: test-py test-js validate contract deploy   ## jalankan seluruh pemeriksaan
+test: test-py test-js test-sim validate contract deploy   ## seluruh pemeriksaan
 
 test-py:                         ## unit test kernel risiko (Python)
 	$(PY) -m pytest -q
@@ -10,6 +10,9 @@ test-py:                         ## unit test kernel risiko (Python)
 test-js:                         ## port JS, adapter MiroFish, kode dalam workflow
 	node --test tests/test_parity.js tests/test_mirofish_adapter.js \
 	  tests/test_workflow_code_nodes.js tests/test_mirofish_verdict_parity.js
+
+test-sim:                        ## rantai workflow 08 melawan server LLM tiruan
+	node --test tests/test_simulation_integration.js
 
 workflows:                       ## regenerasi n8n/workflows/*.json dari generator
 	$(PY) tools/make_n8n_workflows.py

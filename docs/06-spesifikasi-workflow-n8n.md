@@ -133,7 +133,7 @@ atau tanpa timestamp menghasilkan `schema_ok: false` dan `event_risk: "HIGH"` �
 menahan diri, bukan menebak. Amplop itu ditulis ke `mirofish_verdict` dengan
 `ON CONFLICT (run_id) DO NOTHING`, dan `03-trading-loop` membaca baris terbarunya.
 
-## 7. `07-market-research-cache` — 24 node, tiap 15 menit, **nol Code node**
+## 7. `07-market-research-cache` — 27 node, tiap 15 menit
 
 Mengumpulkan intelijen pasar dan menyimpannya sebagai satu dokumen di cache KV (Redis).
 Seluruhnya node asli n8n: `HTTP Request`, `Aggregate`, `Limit`, `Edit Fields`, `Merge`,
@@ -151,6 +151,15 @@ ujung, satu kegagalan akan menggugurkan seluruh dokumen.
 | Fear & Greed | alternative.me | `pg:research:fear_greed` | 1 jam |
 | Aliran stablecoin | DefiLlama (30 titik terakhir) | `pg:research:stablecoin` | 1 jam |
 | Funding & indeks | Pionex publik | `pg:research:funding` | 15 menit |
+
+**Tiga Code node penjaga.** GDELT menolak permintaan dengan **HTTP 200 + teks polos**,
+bukan kode kesalahan, jadi tidak ada node asli yang bisa membedakan data dari teguran.
+Tiga node `Sah: ...` menolak respons yang tidak punya `timeline` atau `articles`. Ini
+satu-satunya Code node yang diizinkan di workflow ini — validator menyebut namanya satu
+per satu, dan menambah Code node lain membuat CI gagal.
+
+Antar panggilan GDELT ada `Wait` 6 detik karena batas 1 permintaan per 5 detik. Tanpa
+jeda itu, dua dari tiga panggilan akan selalu menerima teguran.
 
 **Urutan node di sini penting.** Tiap cabang melewati `Edit Fields` untuk menamai
 field-nya (`tone`, `volume`, …) *sebelum* masuk `Merge`. Tanpa penamaan itu, `Merge`
@@ -185,6 +194,11 @@ menjadi satu opini yang diulang lima kali.
 gerbang risiko. Node 6 sengaja menghasilkan bentuk respons yang sama persis dengan yang
 dulu dihasilkan `mirofish_runner`, jadi mengganti MiroFish asli dengan simulasi n8n
 tidak menyentuh lapisan keputusan sedikit pun.
+
+**Lantai `event_risk` dihitung di kode, bukan diminta di prompt.** Node 4 menghitung
+tingkat risiko tertinggi yang dilaporkan agen mana pun, dan node 6 menegakkannya:
+sintesis boleh menaikkan risiko, tidak boleh menurunkannya. Aturan ini dulunya hanya
+tertulis di prompt sintesis, dan uji membuktikan model tidak mematuhinya.
 
 **Kenapa empat Code node masih ada di sini** (dan tidak ada node asli penggantinya):
 merangkai lima peran menjadi lima prompt berbeda, mem-parse JSON keluaran LLM, dan

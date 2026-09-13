@@ -52,6 +52,11 @@ jobs:
           node --test tests/test_parity.js tests/test_mirofish_adapter.js
           tests/test_workflow_code_nodes.js tests/test_mirofish_verdict_parity.js
 
+      - name: Uji rantai simulasi agen melawan server LLM tiruan
+        env:
+          PYTHON_BIN: python
+        run: node --test tests/test_simulation_integration.js
+
       - name: Validasi struktur workflow n8n
         run: python tools/validate_workflows.py
 

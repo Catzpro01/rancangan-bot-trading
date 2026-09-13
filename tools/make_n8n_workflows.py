@@ -1088,15 +1088,35 @@ return [{ json: {
 # 7. Riset pasar & cache  —  node asli n8n saja, NOL Code node
 # --------------------------------------------------------------------------------------
 
-GDELT_TONE = ("https://api.gdeltproject.org/api/v2/doc/doc?query=%22bitcoin%22%20OR%20"
-              "%22crypto%22&mode=TimelineTone&format=json&timespan=7d")
-GDELT_VOL = ("https://api.gdeltproject.org/api/v2/doc/doc?query=%22bitcoin%22%20OR%20"
-             "%22crypto%22&mode=TimelineVol&format=json&timespan=7d")
+# PENTING: query dengan OR harus dibungkus tanda kurung. Tanpa kurung GDELT membalas
+# "Queries containing OR'd terms must be surrounded by ()." -- dengan HTTP 200, bukan
+# kode kesalahan, dan bukan JSON.
+GDELT_Q = "%28bitcoin%20OR%20crypto%29"
+GDELT_TONE = (f"https://api.gdeltproject.org/api/v2/doc/doc?query={GDELT_Q}"
+              "&mode=TimelineTone&format=json&timespan=7d")
+GDELT_VOL = (f"https://api.gdeltproject.org/api/v2/doc/doc?query={GDELT_Q}"
+             "&mode=TimelineVol&format=json&timespan=7d")
 GDELT_NEG = ("https://api.gdeltproject.org/api/v2/doc/doc?query=bitcoin%20tone%3C-5"
              "&mode=ArtList&format=json&maxrecords=25&sort=DateDesc&timespan=2d")
 FNG = "https://api.alternative.me/fng/?limit=14"
 STABLE_FLOW = "https://stablecoins.llama.fi/stablecoincharts/all?stablecoin=1"
 
+
+
+# Penjaga bentuk respons GDELT. GDELT menolak permintaan dengan HTTP 200 + teks polos
+# ("Please limit requests to one every 5 seconds...", "Queries containing OR'd terms..."),
+# jadi status sukses TIDAK berarti datanya ada. Tanpa penjaga ini, teks teguran masuk ke
+# cache sebagai "data nada berita" lalu dikirim ke agen LLM seolah-olah pasar.
+GDELT_GUARD = """
+// ---- entry point n8n: tolak respons GDELT yang bukan data --------------------------
+const j = (items[0] && items[0].json) || {};
+const sah = Array.isArray(j.timeline) || Array.isArray(j.articles);
+return [{ json: {
+  sah,
+  data: sah ? j : null,
+  galat: sah ? null : String(j).slice(0, 200),
+} }];
+"""
 
 def build_research() -> dict:
     """Kumpulkan intelijen pasar -> simpan sebagai satu dokumen di cache KV.
@@ -1111,24 +1131,32 @@ def build_research() -> dict:
     sym = "{{ $env.PIONEX_SYMBOL }}"
 
     # --- 1. nada berita global (GDELT TimelineTone: rata-rata sentimen per hari) ---
-    f.add(http("GDELT nada berita", "GET", GDELT_TONE, (-900, -300)))
-    f.add(set_fields("Beri nama: tone", [("tone", "={{ $json }}")], (-700, -300)))
+    f.add(http("GDELT nada berita", "GET", GDELT_TONE, (-1000, -300)))
+    f.add(code("Sah: nada berita", guard_body(GDELT_GUARD), (-820, -300)))
+    f.add(set_fields("Beri nama: tone", [("tone", "={{ $json }}")], (-640, -300)))
     f.add(redis_set("Cache nada berita", "pg:research:tone",
-                    "={{ JSON.stringify($json.tone) }}", 3600, (-500, -300)))
+                    "={{ JSON.stringify($json.tone) }}", 3600, (-460, -300)))
 
     # --- 2. volume berita (untuk mendeteksi lonjakan pemberitaan) ---
-    f.add(http("GDELT volume berita", "GET", GDELT_VOL, (-900, -180)))
-    f.add(set_fields("Beri nama: volume", [("volume", "={{ $json }}")], (-700, -180)))
+    # Jeda 6 detik: GDELT menolak lebih dari 1 permintaan per 5 detik, dan menolak
+    # dengan HTTP 200 sehingga kegagalan ini tidak terlihat sebagai kegagalan.
+    f.add(wait_node("Jeda GDELT 1", 6, (-1000, -180)))
+    f.add(http("GDELT volume berita", "GET", GDELT_VOL, (-820, -180)))
+    f.add(code("Sah: volume berita", guard_body(GDELT_GUARD), (-640, -180)))
+    f.add(set_fields("Beri nama: volume", [("volume", "={{ $json }}")], (-460, -180)))
     f.add(redis_set("Cache volume berita", "pg:research:volume",
-                    "={{ JSON.stringify($json.volume) }}", 3600, (-500, -180)))
+                    "={{ JSON.stringify($json.volume) }}", 3600, (-280, -180)))
 
     # --- 3. berita bernada paling negatif 2 hari terakhir ---
-    f.add(http("GDELT berita negatif", "GET", GDELT_NEG, (-900, -60)))
-    f.add(limit_node("Batasi 15 berita", 15, (-760, -60)))
-    f.add(set_fields("Beri nama: negative", [("negative", "={{ $json.articles || [] }}")],
-                     (-560, -60)))
+    f.add(wait_node("Jeda GDELT 2", 6, (-1000, -60)))
+    f.add(http("GDELT berita negatif", "GET", GDELT_NEG, (-820, -60)))
+    f.add(code("Sah: berita negatif", guard_body(GDELT_GUARD), (-640, -60)))
+    f.add(set_fields("Beri nama: negative",
+                     [("negative", "={{ ($json.data && $json.data.articles) || [] }}")],
+                     (-460, -60)))
+    f.add(limit_node("Batasi 15 berita", 15, (-320, -60)))
     f.add(redis_set("Cache berita negatif", "pg:research:negative",
-                    "={{ JSON.stringify($json.negative) }}", 3600, (-360, -60)))
+                    "={{ JSON.stringify($json.negative) }}", 3600, (-180, -60)))
 
     # --- 4. Fear & Greed 14 hari ---
     f.add(http("Fear & Greed", "GET", FNG, (-900, 60)))
@@ -1163,16 +1191,23 @@ def build_research() -> dict:
     f.add(redis_set("Cache induk (kv)", "pg:research:latest",
                     "={{ JSON.stringify($json) }}", 7200, (440, 0)))
 
-    for src in ("GDELT nada berita", "GDELT volume berita", "GDELT berita negatif",
-                "Fear & Greed", "Aliran stablecoin", "Funding & indeks"):
+    for src in ("GDELT nada berita", "Fear & Greed", "Aliran stablecoin",
+                "Funding & indeks"):
         f.link("Setiap 15 menit", src)
-    f.link("GDELT nada berita", "Beri nama: tone")
+    f.link("GDELT nada berita", "Sah: nada berita")
+    f.link("Sah: nada berita", "Beri nama: tone")
     f.link("Beri nama: tone", "Cache nada berita")
-    f.link("GDELT volume berita", "Beri nama: volume")
+    f.link("Setiap 15 menit", "Jeda GDELT 1")
+    f.link("Jeda GDELT 1", "GDELT volume berita")
+    f.link("GDELT volume berita", "Sah: volume berita")
+    f.link("Sah: volume berita", "Beri nama: volume")
     f.link("Beri nama: volume", "Cache volume berita")
-    f.link("GDELT berita negatif", "Batasi 15 berita")
-    f.link("Batasi 15 berita", "Beri nama: negative")
-    f.link("Beri nama: negative", "Cache berita negatif")
+    f.link("Setiap 15 menit", "Jeda GDELT 2")
+    f.link("Jeda GDELT 2", "GDELT berita negatif")
+    f.link("GDELT berita negatif", "Sah: berita negatif")
+    f.link("Sah: berita negatif", "Beri nama: negative")
+    f.link("Beri nama: negative", "Batasi 15 berita")
+    f.link("Batasi 15 berita", "Cache berita negatif")
     f.link("Fear & Greed", "Beri nama: fear_greed")
     f.link("Beri nama: fear_greed", "Cache fear greed")
     f.link("Aliran stablecoin", "Rangkai deret stablecoin")
@@ -1310,6 +1345,21 @@ for (const item of items) {
 
 const gagal = opinions.filter((o) => !o.parsed).length;
 
+// LANTAI KERAS untuk event_risk.
+// Aturan "bila ada satu agen menyebut risiko peristiwa, event_risk tidak boleh LOW"
+// sebelumnya hanya tertulis di PROMPT sintesis. Ternyata tidak cukup: pada uji dengan
+// berita exploit, agen risiko menjawab HIGH tetapi sintesis menurunkannya jadi MEDIUM
+// karena empat agen lain menjawab LOW -- dan prompt tidak bisa memaksa model.
+// Karena itu lantainya dihitung DI SINI, di kode, dan ditegakkan di pembungkus verdict.
+// Aturan keselamatan yang bergantung pada kepatuhan model bukan aturan.
+const RANK = { LOW: 0, MEDIUM: 1, HIGH: 2 };
+let lantai = 'LOW';
+for (const o of opinions) {
+  const r = o.parsed && typeof o.parsed.event_risk === 'string'
+    ? o.parsed.event_risk.toUpperCase() : null;
+  if (r && RANK[r] !== undefined && RANK[r] > RANK[lantai]) lantai = r;
+}
+
 const body = JSON.stringify({
   model,
   temperature: 0.1,
@@ -1328,7 +1378,7 @@ const body = JSON.stringify({
   ],
 });
 
-return [{ json: { agent: 'sintesis', agen_gagal: gagal,
+return [{ json: { agent: 'sintesis', agen_gagal: gagal, lantai_event_risk: lantai,
                   jumlah_agen: opinions.length, body } }];
 """
 
@@ -1341,6 +1391,17 @@ const j = $json || {};
 const raw = (j.choices && j.choices[0] && j.choices[0].message
              && j.choices[0].message.content) || null;
 const verdict = extractJsonObject(raw);
+
+// Tegakkan lantai yang dihitung di node sintesis. Sintesis boleh menaikkan risiko,
+// tidak boleh menurunkannya di bawah yang dilaporkan agen mana pun.
+const RANK = { LOW: 0, MEDIUM: 1, HIGH: 2 };
+const lantai = typeof j.lantai_event_risk === 'string'
+  ? j.lantai_event_risk.toUpperCase() : 'LOW';
+if (verdict && RANK[lantai] !== undefined) {
+  const kini = typeof verdict.event_risk === 'string'
+    ? verdict.event_risk.toUpperCase() : 'LOW';
+  if (RANK[kini] === undefined || RANK[kini] < RANK[lantai]) verdict.event_risk = lantai;
+}
 
 const now = new Date().toISOString();
 const runId = 'n8n-sim-' + Date.now();
@@ -1364,18 +1425,24 @@ def build_simulation() -> dict:
     f.add(code("Bangun panggilan agen",
                guard_body(ENTRY_BUILD_AGENT_CALLS.replace("__AGENTS__", agents_literal)),
                (-600, 0)))
+    # Header X-Pg-Role bukan bagian dari protokol OpenAI; penyedia mana pun akan
+    # mengabaikannya. Fungsinya observasi: di log penyedia terlihat agen mana yang
+    # menghabiskan token. Sekaligus membuat server tiruan tidak perlu menebak peran
+    # dari isi prompt -- menebak dari teks terbukti rapuh.
     f.add(http("LLM paralel (5 agen)", "POST",
                "={{ $env.LLM_API_BASE }}/chat/completions", (-350, 0),
                body="={{ $json.body }}",
                headers={"Authorization": "=Bearer {{ $env.LLM_API_KEY }}",
-                        "Content-Type": "application/json"}))
+                        "Content-Type": "application/json",
+                        "X-Pg-Role": "={{ $json.agent }}"}))
     f.add(code("Simpulkan pendapat agen",
                guard_body(EXTRACT_JSON_HELPER + ENTRY_SYNTHESIZE), (-100, 0)))
     f.add(http("LLM sintesis", "POST",
                "={{ $env.LLM_API_BASE }}/chat/completions", (150, 0),
                body="={{ $json.body }}",
                headers={"Authorization": "=Bearer {{ $env.LLM_API_KEY }}",
-                        "Content-Type": "application/json"}))
+                        "Content-Type": "application/json",
+                        "X-Pg-Role": "=sintesis"}))
     f.add(code("Bungkus jadi verdict",
                guard_body(EXTRACT_JSON_HELPER + ENTRY_WRAP_VERDICT), (400, 0)))
     f.add(code("Adapter verdict", adapter_body(), (650, 0)))

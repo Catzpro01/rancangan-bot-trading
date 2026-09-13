@@ -165,6 +165,25 @@ function toEnvelope(raw) {
 
   const riskText = textOf([prediction, verdict.key_dynamics, verdict.signals, summary]);
   const risk = detectEventRisk(riskText);
+
+  // Ada DUA bukti tentang risiko peristiwa, dan keduanya sah:
+  //   1. pemindaian kata kunci di teks (di atas) -- LLM tidak bisa mengakalinya,
+  //   2. `verdict.event_risk` yang dinyatakan sendiri oleh LLM.
+  // Sebelumnya yang kedua DIABAIKAN sama sekali. Akibatnya sebuah verdict yang
+  // menyebut "exploit" di kolom event_risk tetapi tidak di dalam teks lolos sebagai
+  // LOW. Untuk sistem yang mengutamakan keselamatan, keduanya dipakai dan yang
+  // paling konservatif yang menang.
+  const RISK_RANK = { LOW: 0, MEDIUM: 1, HIGH: 2 };
+  const dinyatakan = typeof verdict.event_risk === 'string'
+    ? verdict.event_risk.toUpperCase() : null;
+  let tingkat = risk.level;
+  let dinaikkan = null;
+  if (dinyatakan && RISK_RANK[dinyatakan] !== undefined
+      && RISK_RANK[dinyatakan] > RISK_RANK[tingkat]) {
+    tingkat = dinyatakan;
+    dinaikkan = dinyatakan;
+  }
+
   const bias = detectBias(prediction + '\n' + textOf(verdict.signals));
 
   if (!verdictTs) return base;
@@ -175,12 +194,16 @@ function toEnvelope(raw) {
     schema_ok: true,
     bias,
     confidence: clamp01(conf.value),
-    event_risk: risk.level,
-    risk_score: risk.score,
+    event_risk: tingkat,
+    risk_score: dinaikkan === 'HIGH'
+      ? Math.max(risk.score, 0.66)
+      : (dinyatakan === 'MEDIUM' && risk.score < 0.33 ? 0.33 : risk.score),
     horizon_hours: Number(verdict.horizon_hours || 24),
     evidence: (verdict.key_dynamics || verdict.signals || []).slice(0, 10),
     adapter_version: ADAPTER_VERSION,
-    notes: notes.concat(risk.hits.map((h) => `RISK_WORD:${h}`)),
+    notes: notes
+      .concat(risk.hits.map((h) => `RISK_WORD:${h}`))
+      .concat(dinaikkan ? [`EVENT_RISK_DINYATAKAN:${dinaikkan}`] : []),
   };
 }
 
