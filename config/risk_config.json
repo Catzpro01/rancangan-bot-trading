@@ -1,0 +1,23 @@
+{
+  "risk_per_trade_pct": 0.5,
+  "max_effective_leverage": 3.0,
+  "max_margin_per_trade_pct": 5.0,
+  "max_open_positions": 1,
+  "slippage_buffer_pct": 0.05,
+  "leverage": 50,
+  "liq_buffer_pct": 33.0,
+  "max_signal_age_sec": 900,
+  "max_verdict_age_sec": 21600,
+  "min_gate_score": 0.55,
+  "min_confidence": 0.6,
+  "veto_if_high_event_risk": true,
+  "veto_on_negative_ev": true,
+  "min_rr_ratio": 1.1,
+  "max_daily_loss_pct": 3.0,
+  "max_drawdown_pct": 10.0,
+  "max_consecutive_losses": 3,
+  "cooldown_minutes_after_trip": 240,
+  "funding_rate_per_interval": 0.0001,
+  "funding_intervals_per_day": 3,
+  "max_hold_hours": 24.0
+}

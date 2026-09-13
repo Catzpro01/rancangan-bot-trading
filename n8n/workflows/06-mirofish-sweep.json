@@ -1,0 +1,417 @@
+{
+  "name": "Pionex Guard \u2014 06 MiroFish Sweep",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 4
+            }
+          ]
+        }
+      },
+      "id": "19215f44-24d7-50e6-fec3-a61c035db29a",
+      "name": "Setiap 4 jam",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -900,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst symbol = $env.PIONEX_SYMBOL;\nreturn [{ json: {\n  requirement: `Dalam 24 jam ke depan, untuk aset ${symbol}: peristiwa apa yang paling `\n    + `mungkin mengguncang harga secara tiba-tiba? Nilai tingkat risiko peristiwa sebagai `\n    + `LOW, MEDIUM, atau HIGH, dan sebutkan bukti serta pemicu waktu spesifiknya.`,\n  files: [],\n  platform: 'parallel',\n  max_rounds: 10,\n  symbol,\n}}];\n"
+      },
+      "id": "04a05cf0-4bcb-db61-9f14-b8aa5472d011",
+      "name": "Susun seed & requirement",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -600,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.MIROFISH_RUNNER_URL }}/jobs",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Runner-Token",
+              "value": "={{ $env.MIROFISH_RUNNER_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ requirement: $json.requirement, files: $json.files, platform: $json.platform, max_rounds: $json.max_rounds }) }}"
+      },
+      "id": "a8ef779f-3b87-2276-34c2-9709a1178fbb",
+      "name": "Kirim job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -350,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO mirofish_run_log (job_id, symbol, status, started_at) VALUES ('{{ $json.data.job_id || $json.job_id }}', '{{ $env.PIONEX_SYMBOL }}', 'RUNNING', now());",
+        "options": {}
+      },
+      "id": "baea5427-3c13-93f5-7558-6e33da0464e4",
+      "name": "Catat job",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -100,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 2
+            }
+          ]
+        }
+      },
+      "id": "af056f20-4e93-0deb-24f1-e077a3e3d80b",
+      "name": "Poll tiap 2 menit",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -900,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT job_id FROM mirofish_run_log WHERE status = 'RUNNING' ORDER BY started_at LIMIT 1;",
+        "options": {}
+      },
+      "id": "729dfed8-3004-d379-1c17-7e6659f1da03",
+      "name": "Ambil job berjalan",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -600,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.MIROFISH_RUNNER_URL }}/jobs/{ $json.job_id }",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Runner-Token",
+              "value": "={{ $env.MIROFISH_RUNNER_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "50a056a2-bd81-4e7c-79c1-05d0d321294f",
+      "name": "Cek status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -350,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.data.status || $json.status }}",
+              "rightValue": "COMPLETED",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "dd2b39fa-cfcc-f32e-36ef-244f231fff81",
+      "name": "Selesai?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        400,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.MIROFISH_RUNNER_URL }}/jobs/{ $json.job_id }/verdict",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Runner-Token",
+              "value": "={{ $env.MIROFISH_RUNNER_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "d743d118-2814-aed5-fb8a-bf427cd2ef3a",
+      "name": "Ambil verdict",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        150,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n/code/mirofish_adapter.js\n// Mengubah verdict mentah MiroFish menjadi envelope terstandar yang dibaca gerbang risiko.\n//\n// Prinsip: GAGAL = VETO. Bila apa pun tidak jelas, hasilnya schema_ok=false atau\n// bias='NEUTRAL' -- tidak pernah menebak arah.\n//\n// Input  : { verdict?: {...}, summary?: {...}, manifest?: {...}, job_id?: string }\n// Output : { run_id, verdict_ts, schema_ok, bias, confidence, event_risk,\n//            horizon_hours, evidence, adapter_version, notes[] }\n\nconst ADAPTER_VERSION = '1.0.0';\n\n// Hanya istilah yang hampir pasti tidak muncul sebagai substring kata lain.\n// Kata pendek ('long','short','buy','sell') sengaja TIDAK dipakai: di teks campuran\n// Indonesia/Inggris kata seperti \"naik\" atau \"turun\" bisa muncul di dalam kata lain\n// (\"du-a naik\"? \"me-nurun\") dan menghasilkan bias palsu. Lebih baik NEUTRAL.\nconst LONG_WORDS = ['bullish', 'rally', 'uptrend', 'breakout', 'surge', 'buying pressure'];\nconst SHORT_WORDS = ['bearish', 'selloff', 'sell-off', 'downtrend', 'dump', 'selling pressure'];\nconst RISK_WORDS = [\n  ['liquidation', 0.35], ['likuidasi', 0.35], ['hack', 0.4], ['exploit', 0.4],\n  ['rug pull', 0.4], ['depeg', 0.4], ['insolven', 0.4], ['insolvent', 0.4],\n  ['sec ', 0.3], ['regulator', 0.25], ['ban', 0.3], ['lawsuit', 0.3], ['gugatan', 0.3],\n  ['fomc', 0.3], ['cpi', 0.3], ['nfp', 0.25], ['etf decision', 0.3],\n  ['expiry', 0.2], ['black swan', 0.45], ['crash', 0.4], ['panic', 0.3],\n  ['delisting', 0.3], ['outage', 0.25], ['maintenance darurat', 0.3],\n  ['pengumuman', 0.2], ['kebijakan', 0.2], ['sanksi', 0.3], ['default', 0.3],\n  ['volatilitas tinggi', 0.3], ['ketidakpastian', 0.25], ['intervensi', 0.3],\n];\n\nfunction clamp01(x) {\n  const n = Number(x);\n  if (!Number.isFinite(n)) return 0;\n  return Math.min(1, Math.max(0, n));\n}\n\nfunction textOf(obj) {\n  if (!obj) return '';\n  const parts = [];\n  const walk = (v, depth) => {\n    if (depth > 4 || v == null) return;\n    if (typeof v === 'string') { parts.push(v); return; }\n    if (typeof v === 'number' || typeof v === 'boolean') { parts.push(String(v)); return; }\n    if (Array.isArray(v)) { v.forEach((x) => walk(x, depth + 1)); return; }\n    if (typeof v === 'object') Object.values(v).forEach((x) => walk(x, depth + 1));\n  };\n  walk(obj, 0);\n  return parts.join('\\n');\n}\n\nfunction detectBias(text) {\n  const t = String(text || '').toLowerCase();\n  let longScore = 0;\n  let shortScore = 0;\n  for (const w of LONG_WORDS) if (t.includes(w)) longScore += 1;\n  for (const w of SHORT_WORDS) if (t.includes(w)) shortScore += 1;\n  if (longScore === 0 && shortScore === 0) return 'NEUTRAL';\n  // Ada sinyal dari dua arah = ambigu. Jangan menebak.\n  if (longScore > 0 && shortScore > 0) return 'NEUTRAL';\n  // Satu istilah saja belum cukup untuk menetapkan arah.\n  if (longScore >= 2) return 'LONG';\n  if (shortScore >= 2) return 'SHORT';\n  return 'NEUTRAL';\n}\n\nfunction detectEventRisk(text) {\n  const t = String(text || '').toLowerCase();\n  let score = 0;\n  const hits = [];\n  for (const [w, weight] of RISK_WORDS) {\n    if (t.includes(w)) {\n      score += weight;\n      hits.push(w);\n    }\n  }\n  const level = score >= 0.66 ? 'HIGH' : score >= 0.33 ? 'MEDIUM' : 'LOW';\n  return { level, score: Math.min(1, score), hits };\n}\n\nfunction pickConfidence(verdict) {\n  const candidates = [\n    verdict?.confidence,\n    verdict?.confidence_score,\n    verdict?.prediction_confidence,\n    verdict?.score,\n    verdict?.probability,\n    verdict?.summary?.confidence,\n  ];\n  for (const c of candidates) {\n    // HATI-HATI: Number(undefined) === 0 dan Number(null) === 0 di JavaScript.\n    // Tanpa pemeriksaan tipe di bawah, verdict tanpa confidence akan lolos sebagai\n    // \"confidence 0\" -- yaitu persis jenis kegagalan senyap yang harus dicegah.\n    if (typeof c !== 'number' && typeof c !== 'string') continue;\n    if (typeof c === 'string' && c.trim() === '') continue;\n    const n = Number(c);\n    if (Number.isFinite(n) && n >= 0 && n <= 1) return { value: n, source: 'explicit' };\n  }\n  return { value: 0, source: 'missing' };\n}\n\n// Entry point utama. `raw` adalah isi respons GET /jobs/{id}/verdict.\nfunction toEnvelope(raw) {\n  const notes = [];\n  const verdict = raw?.verdict || raw?.data?.verdict || null;\n  const summary = raw?.summary || raw?.data?.summary || null;\n  const manifest = raw?.manifest || raw?.data?.manifest || null;\n  const runId = raw?.run_id || manifest?.run_id || raw?.job_id || null;\n\n  const base = {\n    run_id: runId,\n    verdict_ts: null,\n    schema_ok: false,\n    bias: 'NEUTRAL',\n    confidence: 0,\n    event_risk: 'HIGH',   // default paling konservatif\n    horizon_hours: 24,\n    evidence: [],\n    adapter_version: ADAPTER_VERSION,\n    notes,\n  };\n\n  if (!verdict || typeof verdict !== 'object') {\n    notes.push('VERDICT_MISSING');\n    return base;\n  }\n\n  const prediction = verdict.prediction || verdict.summary || null;\n  if (typeof prediction !== 'string' || prediction.trim().length < 20) {\n    notes.push('PREDICTION_MISSING_OR_TOO_SHORT');\n    return base;\n  }\n\n  const conf = pickConfidence(verdict);\n  if (conf.source === 'missing') {\n    notes.push('CONFIDENCE_MISSING');\n    return base;\n  }\n\n  const riskText = textOf([prediction, verdict.key_dynamics, verdict.signals, summary]);\n  const risk = detectEventRisk(riskText);\n  const bias = detectBias(prediction + '\\n' + textOf(verdict.signals));\n\n  const tsRaw = manifest?.created_at || verdict.generated_at || verdict.timestamp || raw?.created_at;\n  let verdictTs = null;\n  if (tsRaw) {\n    const t = Date.parse(String(tsRaw).replace(' ', 'T'));\n    if (!Number.isNaN(t)) verdictTs = new Date(t).toISOString().replace('.000Z', 'Z');\n    else notes.push('UNPARSEABLE_TIMESTAMP');\n  } else {\n    notes.push('TIMESTAMP_MISSING');\n  }\n  if (!verdictTs) return { ...base, notes };\n\n  return {\n    run_id: runId,\n    verdict_ts: verdictTs,\n    schema_ok: true,\n    bias,\n    confidence: clamp01(conf.value),\n    event_risk: risk.level,\n    horizon_hours: Number(verdict.horizon_hours || 24),\n    evidence: (verdict.key_dynamics || verdict.signals || []).slice(0, 10),\n    adapter_version: ADAPTER_VERSION,\n    notes: notes.concat(risk.hits.map((h) => `RISK_WORD:${h}`)),\n    risk_score: risk.score,\n  };\n}\n\n// ---- entry point n8n: verdict mentah -> envelope terstandar --------------------------\nconst out = [];\nfor (const item of items) {\n  out.push({ json: toEnvelope(item.json) });\n}\nreturn out;\n"
+      },
+      "id": "93b4ed6d-fd97-542f-3b0e-399b78e1e847",
+      "name": "Adapter verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO mirofish_verdict (run_id, verdict_ts, schema_ok, bias, confidence, event_risk, horizon_hours, evidence, adapter_version, raw) VALUES ('{{ $json.run_id }}', '{{ $json.verdict_ts }}', {{ $json.schema_ok }}, '{{ $json.bias }}', {{ $json.confidence }}, '{{ $json.event_risk }}', {{ $json.horizon_hours }}, '{{ JSON.stringify($json.evidence) }}'::jsonb, '{{ $json.adapter_version }}', '{{ JSON.stringify($json) }}'::jsonb) ON CONFLICT (run_id) DO NOTHING;",
+        "options": {}
+      },
+      "id": "8d3b64e4-af13-bd67-11f9-c28161770c9d",
+      "name": "Simpan verdict",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        650,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $env.ALERT_EMAIL }}",
+        "subject": "=Pionex Guard: {{ $json.reason || $json.problems || 'alert' }}",
+        "text": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "49ba1693-a206-2aef-df99-b14b3a05243a",
+      "name": "Notifikasi veto",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        650,
+        380
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - SMTP"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Setiap 4 jam": {
+      "main": [
+        [
+          {
+            "node": "Susun seed & requirement",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Susun seed & requirement": {
+      "main": [
+        [
+          {
+            "node": "Kirim job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kirim job": {
+      "main": [
+        [
+          {
+            "node": "Catat job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll tiap 2 menit": {
+      "main": [
+        [
+          {
+            "node": "Ambil job berjalan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ambil job berjalan": {
+      "main": [
+        [
+          {
+            "node": "Cek status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cek status": {
+      "main": [
+        [
+          {
+            "node": "Selesai?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Selesai?": {
+      "main": [
+        [
+          {
+            "node": "Ambil verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ambil verdict": {
+      "main": [
+        [
+          {
+            "node": "Adapter verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adapter verdict": {
+      "main": [
+        [
+          {
+            "node": "Simpan verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simpan verdict": {
+      "main": [
+        [
+          {
+            "node": "Notifikasi veto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveExecutionProgress": true
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "pionex-guard-50x"
+    }
+  ]
+}

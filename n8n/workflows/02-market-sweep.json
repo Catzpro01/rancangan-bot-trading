@@ -1,0 +1,332 @@
+{
+  "name": "Pionex Guard \u2014 02 Market Sweep",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "862fb744-fee4-5d06-badf-be4c06b1cc08",
+      "name": "Setiap 1 menit",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -900,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.pionex.com/api/v1/market/klines?symbol={{ $env.PIONEX_SYMBOL }}&interval=1m&limit=60",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "0bbf2359-56e0-04b7-8183-07a3382c8200",
+      "name": "Klines 1m",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -700,
+        -200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.pionex.com/api/v1/market/indexes?symbol={{ $env.PIONEX_SYMBOL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "d7d38fb7-dd07-95dc-176d-24913359270c",
+      "name": "Index & funding",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -700,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.pionex.com/api/v1/market/depth?symbol={{ $env.PIONEX_SYMBOL }}&limit=200",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "01ee13b1-18e1-d4f9-3208-e0fc6f6c093f",
+      "name": "Depth",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -700,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.pionex.com/api/v1/common/symbols?symbols={{ $env.PIONEX_SYMBOL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "e6d6dde1-28fb-0a97-ef8b-806eea469b33",
+      "name": "Symbols",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -700,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.pionex.com/api/v1/common/riskTable?symbol={{ $env.PIONEX_SYMBOL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "995ced73-1724-77f2-28ca-ce7fa436b5c8",
+      "name": "Risk table",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -700,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst out = [];\nconst byName = {};\nfor (const item of items) byName[item.json.__node || 'x'] = item.json;\n// n8n memberi item per input; kumpulkan sederhana lalu hitung ATR(14) dari klines\nconst klines = items.flatMap(i => (i.json?.data?.klines) || []);\nlet atr = 0;\nif (klines.length > 15) {\n  let sum = 0;\n  for (let i = klines.length - 14; i < klines.length; i++) {\n    const h = Number(klines[i].high), l = Number(klines[i].low), pc = Number(klines[i - 1].close);\n    sum += Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));\n  }\n  atr = sum / 14;\n}\nconst sym = $env.PIONEX_SYMBOL;\nout.push({ json: {\n  symbol: sym,\n  ts: new Date().toISOString(),\n  atr_1m: atr,\n  klines: klines.slice(-60),\n  raw: items.map(i => i.json),\n}});\nreturn out;\n"
+      },
+      "id": "c8d2478f-8414-6153-3614-f8dbba3bdc73",
+      "name": "Susun snapshot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -300,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO market_snapshot (symbol, ts, payload) VALUES ('{{ $json.symbol }}', now(), '{{ JSON.stringify($json) }}'::jsonb);",
+        "options": {}
+      },
+      "id": "ea6dc56c-7209-94d9-aee7-d1043fb0aaa3",
+      "name": "Simpan snapshot",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        0,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE bot_state SET last_market_beat = now() WHERE id = (SELECT max(id) FROM bot_state);",
+        "options": {}
+      },
+      "id": "47fbdb21-cc42-7b74-689e-fed1a7a71013",
+      "name": "Tulis heartbeat",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        0,
+        140
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Setiap 1 menit": {
+      "main": [
+        [
+          {
+            "node": "Klines 1m",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Index & funding",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Depth",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Symbols",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Risk table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Klines 1m": {
+      "main": [
+        [
+          {
+            "node": "Susun snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Index & funding": {
+      "main": [
+        [
+          {
+            "node": "Susun snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Depth": {
+      "main": [
+        [
+          {
+            "node": "Susun snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Symbols": {
+      "main": [
+        [
+          {
+            "node": "Susun snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Risk table": {
+      "main": [
+        [
+          {
+            "node": "Susun snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Susun snapshot": {
+      "main": [
+        [
+          {
+            "node": "Simpan snapshot",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Tulis heartbeat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveExecutionProgress": true
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "pionex-guard-50x"
+    }
+  ]
+}

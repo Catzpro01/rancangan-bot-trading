@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Risk engine + n8n workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Regenerate check — vektor paritas tidak boleh basi
+        run: python tools/make_parity_vectors.py --check
+
+      - name: Regenerate check — workflow n8n tidak boleh basi
+        run: |
+          python tools/make_n8n_workflows.py
+          if [ -n "$(git status --porcelain n8n/workflows)" ]; then
+            echo "Workflow n8n di repo tidak cocok dengan generator."
+            echo "Jalankan 'python tools/make_n8n_workflows.py' lalu commit hasilnya."
+            git --no-pager diff --stat n8n/workflows
+            exit 1
+          fi
+
+      - name: Unit test kernel risiko (Python, termasuk pemanggilan suite Node)
+        run: python -m pytest -q
+
+      - name: Test port JavaScript + adapter MiroFish + kode dalam workflow
+        run: node --test tests/test_parity.js tests/test_mirofish_adapter.js tests/test_workflow_code_nodes.js
+
+      - name: Validasi struktur workflow n8n
+        run: python tools/validate_workflows.py
+
+      - name: Smoke test simulator Monte Carlo
+        run: |
+          python simulator/monte_carlo.py --equity 1000 --trades 200 \
+            --win-rate 0.50 --stop-pct 0.008 --tp-pct 0.010 \
+            --leverage 50 --liq-prob 0.30 --seed 7 --json | tee /tmp/mc.json
+          python - <<'PY'
+          import json
+          d = json.load(open('/tmp/mc.json'))
+          assert len(d['runs']) == 2, d
+          for r in d['runs']:
+              assert r['trades'] > 0, r
+              assert r['max_drawdown_pct'] >= 0, r
+          print('simulator OK:', [r['mode'] for r in d['runs']])
+          PY

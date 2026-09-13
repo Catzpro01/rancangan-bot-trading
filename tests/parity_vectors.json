@@ -1,0 +1,275 @@
+{
+  "_komentar": "Vektor uji bersama: dibaca oleh tests/test_parity_js.py (Python) dan tests/test_parity.py (Node). Nilai `expected` dihitung oleh risk_engine.py -- JANGAN ditulis tangan. Regenerasi: python tools/make_parity_vectors.py",
+  "liquidation_distance": [
+    {
+      "args": {
+        "leverage": 50,
+        "mmr": 0.005,
+        "fee": 0.0005,
+        "side": "LONG"
+      },
+      "expected": 0.014992503748125937
+    },
+    {
+      "args": {
+        "leverage": 50,
+        "mmr": 0.005,
+        "fee": 0.0005,
+        "side": "SHORT"
+      },
+      "expected": 0.015007503751875937
+    },
+    {
+      "args": {
+        "leverage": 10,
+        "mmr": 0.005,
+        "fee": 0.0005,
+        "side": "LONG"
+      },
+      "expected": 0.09495252373813094
+    },
+    {
+      "args": {
+        "leverage": 100,
+        "mmr": 0.005,
+        "fee": 0.0005,
+        "side": "LONG"
+      },
+      "expected": 0.0049975012493753135
+    }
+  ],
+  "liquidation_price": [
+    {
+      "args": {
+        "side": "LONG",
+        "entry": 100000,
+        "leverage": 50,
+        "mmr": 0.005,
+        "fee": 0.0005
+      },
+      "expected": 98500.74962518741
+    },
+    {
+      "args": {
+        "side": "SHORT",
+        "entry": 100000,
+        "leverage": 50,
+        "mmr": 0.005,
+        "fee": 0.0005
+      },
+      "expected": 101500.7503751876
+    }
+  ],
+  "max_usable_rr": [
+    {
+      "args": {
+        "leverage": 50,
+        "stop": 0.008,
+        "mmr": 0.005,
+        "fee": 0.0005,
+        "buffer": 33.0
+      },
+      "expected": 1.686656671664168
+    },
+    {
+      "args": {
+        "leverage": 10,
+        "stop": 0.008,
+        "mmr": 0.005,
+        "fee": 0.0005,
+        "buffer": 33.0
+      },
+      "expected": 10.682158920539731
+    }
+  ],
+  "size_position": [
+    {
+      "args": {
+        "equity": 1000,
+        "entry": 100000,
+        "stop_distance": 0.008,
+        "base_step": 0.0001,
+        "risk_per_trade_pct": 0.5,
+        "max_effective_leverage": 3.0,
+        "max_margin_per_trade_pct": 5.0,
+        "leverage": 50,
+        "slippage_buffer_pct": 0.05
+      },
+      "expected": {
+        "qty": 0.0058,
+        "notional": 580.0,
+        "margin": 11.6,
+        "binding": "RISK_BUDGET"
+      }
+    }
+  ],
+  "min_win_rate_for_profit": [
+    {
+      "args": {
+        "rr": 1.1,
+        "fee": 0.0005
+      },
+      "expected": 0.5238095238095238
+    },
+    {
+      "args": {
+        "rr": 2.0,
+        "fee": 0.0005
+      },
+      "expected": 0.3666666666666667
+    },
+    {
+      "args": {
+        "rr": 4.0,
+        "fee": 0.0005
+      },
+      "expected": 0.22000000000000003
+    }
+  ],
+  "validate_signal": [
+    {
+      "name": "happy_path_long",
+      "signal": {
+        "direction": "LONG",
+        "entry": 100000,
+        "stop": 99200,
+        "take_profit": 100970,
+        "ts": "2026-09-13T11:59:30Z",
+        "mirofish": {
+          "schema_ok": true,
+          "verdict_ts": "2026-09-13T08:00:00Z",
+          "confidence": 0.78,
+          "event_risk": "LOW",
+          "bias": "NEUTRAL"
+        },
+        "stats": {
+          "win_rate": 0.62,
+          "avg_win_pct": 0.0097,
+          "avg_loss_pct": 0.008
+        }
+      },
+      "equity": 1000,
+      "entry": 100000,
+      "now": "2026-09-13T12:00:00Z",
+      "expected": {
+        "approved": true,
+        "reasons": [],
+        "size": 0.0058
+      }
+    },
+    {
+      "name": "high_event_risk_veto",
+      "signal": {
+        "direction": "LONG",
+        "entry": 100000,
+        "stop": 99200,
+        "take_profit": 100970,
+        "ts": "2026-09-13T11:59:30Z",
+        "mirofish": {
+          "schema_ok": true,
+          "verdict_ts": "2026-09-13T08:00:00Z",
+          "confidence": 0.78,
+          "event_risk": "HIGH",
+          "bias": "NEUTRAL"
+        },
+        "stats": {
+          "win_rate": 0.62,
+          "avg_win_pct": 0.0097,
+          "avg_loss_pct": 0.008
+        }
+      },
+      "equity": 1000,
+      "entry": 100000,
+      "now": "2026-09-13T12:00:00Z",
+      "expected": {
+        "approved": false,
+        "reasons": [
+          "MIROFISH_HIGH_EVENT_RISK_VETO"
+        ],
+        "size": 0.0
+      }
+    },
+    {
+      "name": "stop_too_far_for_50x",
+      "signal": {
+        "direction": "LONG",
+        "entry": 100000,
+        "stop": 98550,
+        "take_profit": 103000,
+        "ts": "2026-09-13T11:59:30Z",
+        "mirofish": {
+          "schema_ok": true,
+          "verdict_ts": "2026-09-13T08:00:00Z",
+          "confidence": 0.78,
+          "event_risk": "LOW",
+          "bias": "NEUTRAL"
+        },
+        "stats": {
+          "win_rate": 0.62,
+          "avg_win_pct": 0.03,
+          "avg_loss_pct": 0.0145
+        }
+      },
+      "equity": 1000,
+      "entry": 100000,
+      "now": "2026-09-13T12:00:00Z",
+      "expected": {
+        "approved": false,
+        "reasons": [
+          "STOP_TOO_FAR 1.4500%>=1.0045% (liq=1.4993%, buffer=33.0%)"
+        ],
+        "size": 0.0
+      }
+    },
+    {
+      "name": "stale_verdict",
+      "signal": {
+        "direction": "SHORT",
+        "entry": 100000,
+        "stop": 100800,
+        "take_profit": 99030,
+        "ts": "2026-09-13T11:59:30Z",
+        "mirofish": {
+          "schema_ok": true,
+          "verdict_ts": "2026-09-12T01:00:00Z",
+          "confidence": 0.9,
+          "event_risk": "LOW",
+          "bias": "NEUTRAL"
+        },
+        "stats": {
+          "win_rate": 0.62,
+          "avg_win_pct": 0.0097,
+          "avg_loss_pct": 0.008
+        }
+      },
+      "equity": 1000,
+      "entry": 100000,
+      "now": "2026-09-13T12:00:00Z",
+      "expected": {
+        "approved": false,
+        "reasons": [
+          "MIROFISH_STALE age=126000s"
+        ],
+        "size": 0.0
+      }
+    }
+  ],
+  "client_order_id": [
+    {
+      "args": {
+        "signal_id": "sig-1",
+        "symbol": "BTC_USDT_PERP",
+        "action": "ENTRY"
+      },
+      "expected_prefix": "pg-ENTRY-"
+    },
+    {
+      "args": {
+        "signal_id": "sig-1",
+        "symbol": "BTC_USDT_PERP",
+        "action": "EXIT"
+      },
+      "expected_prefix": "pg-EXIT-"
+    }
+  ]
+}

@@ -1,0 +1,329 @@
+{
+  "name": "Pionex Guard \u2014 04 Position Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "4394244c-3bb5-6a2d-7c52-ccf7bf8197df",
+      "name": "Setiap 15 detik",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -900,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.pionex.com/uapi/v1/account/positions?timestamp=={{ Date.now() }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "PIONEX-KEY",
+              "value": "={{ $env.PIONEX_API_KEY }}"
+            },
+            {
+              "name": "PIONEX-SIGNATURE",
+              "value": "={{ $env.PIONEX_STATIC_READ_SIGNATURE }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "f9acdb32-b495-cc3a-2d04-b73d9f79f18f",
+      "name": "Ambil posisi",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -700,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM open_position WHERE closed_at IS NULL;",
+        "options": {}
+      },
+      "id": "b94ee890-29c2-d25e-c969-9f06e1e43a91",
+      "name": "Baca state posisi",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -700,
+        140
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n/code/risk_guard.js\n// Port JavaScript dari risk_engine/risk_engine.py untuk dijalankan di n8n Code node.\n//\n// PENTING: risk_engine.py adalah SPESIFIKASI. Berkas ini adalah salinan untuk runtime\n// n8n. Keduanya harus tetap sinkron -- bila salah satu diubah, ubah keduanya dan\n// jalankan `python -m pytest -q` serta bandingkan keluaran pada sinyal uji yang sama.\n//\n// Mode n8n Code node: \"Run Once for All Items\"\n// Input  : items = [{ json: { signal, equity, entry, rules, cfg, openPositions, breaker, now } }]\n// Output : [{ json: { ...decision, clientOrderId?, orderBody? } }]\n\nconst DEFAULT_TAKER_FEE = 0.0005;\nconst DEFAULT_MMR = 0.005;\n\n// ---------------------------------------------------------------- likuidasi\n\nfunction liquidationRoom(leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE) {\n  return 1 / leverage - mmr - fee;\n}\n\n// Jarak dari ENTRY ke harga likuidasi (fraksi). Identik dengan Python.\nfunction liquidationDistance(leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE, side = 'LONG') {\n  if (leverage <= 0) throw new Error('leverage harus > 0');\n  const s = String(side).toUpperCase();\n  if (s !== 'LONG' && s !== 'SHORT') throw new Error('side harus LONG atau SHORT');\n  const room = liquidationRoom(leverage, mmr, fee);\n  if (room <= 0) throw new Error(`leverage ${leverage}x tidak menyisakan ruang likuidasi`);\n  return s === 'SHORT' ? (room + fee) / (1 - fee) : (room + fee) / (1 + fee);\n}\n\nfunction liquidationPrice(side, entry, leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE) {\n  const s = String(side).toUpperCase();\n  const imr = 1 / leverage;\n  if (s === 'LONG') return (entry * (1 - imr + mmr + fee)) / (1 + fee);\n  if (s === 'SHORT') return (entry * (1 + imr - mmr - fee)) / (1 - fee);\n  throw new Error('side harus LONG atau SHORT');\n}\n\n// Guard: tolak entry bila estimator lokal tidak cocok dengan angka bursa.\nfunction checkLiqAgainstExchange(side, entry, localLiq, exchangeLiq, tolerance = 0.002) {\n  if (!exchangeLiq || exchangeLiq <= 0) return [false, 'EXCHANGE_LIQ_MISSING'];\n  const drift = Math.abs(localLiq - exchangeLiq) / entry;\n  if (drift > tolerance) return [false, `LIQ_MISMATCH drift=${drift.toFixed(5)} tol=${tolerance}`];\n  const s = String(side).toUpperCase();\n  if (s === 'LONG' && localLiq < exchangeLiq * (1 - tolerance)) return [false, 'LOCAL_LIQ_TOO_OPTIMISTIC_LONG'];\n  if (s === 'SHORT' && localLiq > exchangeLiq * (1 + tolerance)) return [false, 'LOCAL_LIQ_TOO_OPTIMISTIC_SHORT'];\n  return [true, 'OK'];\n}\n\nfunction maxUsableRr(leverage, stopDistance, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE,\n                     liqBufferPct = 33, targetFrac = 0.9) {\n  const d = liquidationDistance(leverage, mmr, fee);\n  const maxStop = d * (1 - liqBufferPct / 100);\n  if (stopDistance <= 0 || stopDistance > maxStop) return 0;\n  return (d * targetFrac) / stopDistance;\n}\n\n// ---------------------------------------------------------------- presisi\n\nfunction roundStep(value, step, mode = 'down') {\n  if (!(step > 0)) return value;\n  const n = mode === 'down' ? Math.floor(value / step + 1e-12) : Math.ceil(value / step - 1e-12);\n  return Math.round(n * step * 1e12) / 1e12;\n}\n\nfunction breakevenMove(fee = DEFAULT_TAKER_FEE) {\n  return fee * 2;\n}\n\n// ---------------------------------------------------------------- EV\n\nfunction expectedValue(winRate, avgWin, avgLoss, cost) {\n  return winRate * avgWin - (1 - winRate) * avgLoss - cost;\n}\n\nfunction minWinRateForProfit(rr, fee = DEFAULT_TAKER_FEE) {\n  const cost = breakevenMove(fee) * 100; // persen, agar satuannya sama dengan avg_win/avg_loss\n  return (1 + cost) / (1 + rr);\n}\n\n// ---------------------------------------------------------------- sizing\n\nfunction sizePosition(equity, entry, stopDistance, rules, cfg) {\n  if (!(equity > 0) || !(entry > 0)) return { qty: 0, reason: 'EQUITY_OR_ENTRY_INVALID' };\n  if (!(stopDistance > 0)) return { qty: 0, reason: 'STOP_DISTANCE_INVALID' };\n\n  const effStop = stopDistance + cfg.slippage_buffer_pct / 100;\n  const riskAmount = (equity * cfg.risk_per_trade_pct) / 100;\n\n  const qtyRisk = riskAmount / (entry * effStop);\n  const qtyLev = (equity * cfg.max_effective_leverage) / entry;\n  const qtyMargin = ((equity * cfg.max_margin_per_trade_pct) / 100) * cfg.leverage / entry;\n\n  const candidates = [\n    ['RISK_BUDGET', qtyRisk],\n    ['EFFECTIVE_LEVERAGE', qtyLev],\n    ['MARGIN_CAP', qtyMargin],\n  ];\n  let qty = Math.min(qtyRisk, qtyLev, qtyMargin);\n  let binding = candidates.reduce((a, b) => (b[1] < a[1] ? b : a))[0];\n\n  const ceiling = (equity * cfg.max_effective_leverage) / entry;\n  if (qty >= ceiling) {\n    qty = ceiling;\n    binding = 'EFFECTIVE_LEVERAGE_CEILING';\n  }\n\n  qty = roundStep(qty, rules.base_step, 'down');\n  qty = Math.min(qty, rules.max_size);\n  const notional = qty * entry;\n  return {\n    qty,\n    notional,\n    margin: notional / cfg.leverage,\n    risk_amount: qty * entry * effStop,\n    binding_constraint: binding,\n  };\n}\n\n// ---------------------------------------------------------------- gerbang utama\n\nfunction ageSec(iso, now) {\n  if (!iso) return Infinity;\n  const t = Date.parse(String(iso).replace('Z', '+00:00'));\n  if (Number.isNaN(t)) return Infinity;\n  return Math.max(0, (now - t) / 1000);\n}\n\n// DEFAULT DENY. Mengembalikan { approved, reasons, ... }.\nfunction validateSignal(signal, equity, entry, rules, cfg, opts = {}) {\n  const now = opts.now || Date.now();\n  const reasons = [];\n  const warnings = [];\n  const stats = signal.stats || {};\n\n  const direction = String(signal.direction || 'NONE').toUpperCase();\n  if (direction !== 'LONG' && direction !== 'SHORT') reasons.push('DIRECTION_NONE');\n\n  // --- Gerbang 1: MiroFish -------------------------------------------------\n  const miro = signal.mirofish || {};\n  if (!miro.schema_ok) reasons.push('MIROFISH_SCHEMA_INVALID');\n  const verdictAge = ageSec(miro.verdict_ts, now);\n  if (verdictAge > cfg.max_verdict_age_sec) reasons.push(`MIROFISH_STALE age=${verdictAge.toFixed(0)}s`);\n  const conf = Number(miro.confidence || 0);\n  if (conf < cfg.min_confidence) reasons.push(`MIROFISH_LOW_CONFIDENCE ${conf.toFixed(2)}<${cfg.min_confidence}`);\n  const eventRisk = String(miro.event_risk || 'UNKNOWN').toUpperCase();\n  if (cfg.veto_if_high_event_risk && eventRisk === 'HIGH') reasons.push('MIROFISH_HIGH_EVENT_RISK_VETO');\n  const bias = String(miro.bias || 'NEUTRAL').toUpperCase();\n  if (bias !== 'NEUTRAL' && bias !== direction && (direction === 'LONG' || direction === 'SHORT')) {\n    reasons.push(`MIROFISH_BIAS_CONFLICT ${bias} vs ${direction}`);\n  }\n\n  // --- Gerbang 2: struktur trade ------------------------------------------\n  const stop = Number(signal.stop);\n  const tp = Number(signal.take_profit);\n  let stopDistance = NaN;\n  let rr = 0;\n  let reward = NaN;\n  if (!Number.isFinite(stop) || !Number.isFinite(tp) || stop <= 0 || tp <= 0) {\n    reasons.push('MISSING_STOP_OR_TP');\n  } else {\n    if (direction === 'LONG') {\n      stopDistance = (entry - stop) / entry;\n      reward = (tp - entry) / entry;\n    } else {\n      stopDistance = (stop - entry) / entry;\n      reward = (entry - tp) / entry;\n    }\n    if (stopDistance <= 0) reasons.push('STOP_ON_WRONG_SIDE');\n    if (reward <= 0) reasons.push('TP_ON_WRONG_SIDE');\n    rr = stopDistance > 0 ? reward / stopDistance : 0;\n    if (rr < cfg.min_rr_ratio) reasons.push(`RR_TOO_LOW ${rr.toFixed(2)}<${cfg.min_rr_ratio}`);\n  }\n\n  const sigAge = ageSec(signal.ts, now);\n  if (sigAge > cfg.max_signal_age_sec) reasons.push(`SIGNAL_STALE age=${sigAge.toFixed(0)}s`);\n\n  // --- Gerbang 3: likuidasi ------------------------------------------------\n  let liqDist = NaN;\n  try {\n    liqDist = liquidationDistance(cfg.leverage, rules.mmr, rules.taker_fee, direction);\n  } catch (e) {\n    reasons.push(`LEVERAGE_CONFIG_INVALID ${e.message}`);\n  }\n  if (Number.isFinite(liqDist) && Number.isFinite(stopDistance)) {\n    const maxAllowed = liqDist * (1 - cfg.liq_buffer_pct / 100);\n    if (stopDistance >= maxAllowed) {\n      reasons.push(`STOP_TOO_FAR ${(stopDistance * 100).toFixed(4)}%>=${(maxAllowed * 100).toFixed(4)}%`);\n    }\n  }\n\n  // --- Gerbang 4: statistik & EV -------------------------------------------\n  const winRate = Number(stats.win_rate || 0);\n  const avgWin = Number(stats.avg_win_pct || 0);\n  const avgLoss = Number(stats.avg_loss_pct || 1);\n  const cost = breakevenMove(rules.taker_fee);\n  const ev = expectedValue(winRate, avgWin, avgLoss, cost);\n  if (winRate <= 0) reasons.push('NO_TRACK_RECORD');\n  else if (cfg.veto_on_negative_ev && ev <= 0) reasons.push(`NEGATIVE_EV ${ev.toFixed(5)}`);\n  if (Number.isFinite(stopDistance) && stopDistance > 0 && avgLoss > stopDistance * 1.05) {\n    reasons.push(`STATS_INCONSISTENT avg_loss=${avgLoss.toFixed(5)} > stop=${stopDistance.toFixed(5)}`);\n  }\n  if (avgWin > 0 && reward > 0 && avgWin > reward * 1.05) {\n    reasons.push(`STATS_INCONSISTENT avg_win=${avgWin.toFixed(5)} > reward=${reward.toFixed(5)}`);\n  }\n\n  // --- Gerbang 5: kapasitas & breaker --------------------------------------\n  const openPositions = Number(opts.openPositions || 0);\n  if (openPositions >= cfg.max_open_positions) {\n    reasons.push(`MAX_OPEN_POSITIONS ${openPositions}>=${cfg.max_open_positions}`);\n  }\n  if (opts.breaker && opts.breaker.tripped) {\n    reasons.push(`CIRCUIT_BREAKER_TRIPPED ${opts.breaker.reason || ''}`);\n  }\n\n  // --- Sizing --------------------------------------------------------------\n  let sizing = {};\n  if (Number.isFinite(stopDistance) && stopDistance > 0) {\n    sizing = sizePosition(equity, entry, stopDistance, rules, cfg);\n  }\n  const qty = Number(sizing.qty || 0);\n  const notional = Number(sizing.notional || 0);\n  if (qty <= 0) reasons.push('SIZE_ZERO');\n  else {\n    if (qty < rules.min_size) reasons.push(`BELOW_MIN_SIZE ${qty}<${rules.min_size}`);\n    if (notional < rules.min_notional) reasons.push(`BELOW_MIN_NOTIONAL ${notional}<${rules.min_notional}`);\n    if (notional > equity * cfg.max_effective_leverage) reasons.push('EFFECTIVE_LEVERAGE_BREACH');\n  }\n\n  // --- Peringatan ----------------------------------------------------------\n  if (Number.isFinite(liqDist) && liqDist < 0.02) {\n    warnings.push(`LIQ_DISTANCE_TINY ${(liqDist * 100).toFixed(3)}% -- ruang stop sempit`);\n  }\n  if (conf < 0.75) warnings.push('MIROFISH_CONFIDENCE_MARGINAL');\n  if (rules.taker_fee > 0.0005) warnings.push('HIGH_TAKER_FEE');\n\n  const approved = reasons.length === 0;\n  return {\n    approved,\n    reasons,\n    warnings,\n    size: approved ? qty : 0,\n    notional: approved ? notional : 0,\n    margin: approved ? Number(sizing.margin || 0) : 0,\n    stop_distance_pct: Number.isFinite(stopDistance) ? stopDistance : 0,\n    liq_distance_pct: Number.isFinite(liqDist) ? liqDist : 0,\n    risk_amount: approved ? Number(sizing.risk_amount || 0) : 0,\n    rr_ratio: rr,\n    ev_per_trade_pct: ev,\n    effective_leverage: approved && equity > 0 ? notional / equity : 0,\n    binding_constraint: sizing.binding_constraint || '',\n  };\n}\n\n// ---------------------------------------------------------------- idempotensi & signing\n\nfunction buildClientOrderId(signalId, symbol, action) {\n  const crypto = require('crypto');\n  const digest = crypto.createHash('sha256').update(`${signalId}|${symbol}|${action}`).digest('hex').slice(0, 24);\n  const act = String(action).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8) || 'ACT';\n  return `pg-${act}-${digest}`.slice(0, 64);\n}\n\nfunction signPionex(method, path, query, body, secret) {\n  const crypto = require('crypto');\n  const joined = Object.keys(query).sort().map((k) => `${k}=${query[k]}`).join('&');\n  const pathUrl = joined ? `${path}?${joined}` : path;\n  let payload = `${method.toUpperCase()}${pathUrl}`;\n  if (method.toUpperCase() === 'POST' || method.toUpperCase() === 'DELETE') payload += body || '';\n  return crypto.createHmac('sha256', secret).update(payload, 'utf8').digest('hex');\n}\n\n// ---------------------------------------------------------------- entry point n8n\n\n\n// Di n8n Code node, tempelkan fungsi-fungsi di atas lalu akhiri dengan blok berikut\n// (module.exports diabaikan oleh n8n, tetapi membuat berkas ini bisa di-require saat uji):\n/*\n  const out = [];\n  for (const item of items) {\n    const { signal, equity, entry, rules, cfg, openPositions, breaker } = item.json;\n    const decision = validateSignal(signal, equity, entry, rules, cfg,\n                                    { openPositions, breaker, now: Date.now() });\n    out.push({ json: { ...decision, signal_id: signal.id || null } });\n  }\n  return out;\n*/\n\n// ---- entry point n8n: trailing stop + keputusan exit --------------------------------\nconst out = [];\nfor (const item of items) {\n  const j = item.json;\n  const pos = j.position;              // dari GET /uapi/v1/account/positions\n  const mark = Number(pos.markPrice);\n  const atr = Number(j.atr || 0);\n  const side = pos.netSize >= 0 ? 'LONG' : 'SHORT';\n  const state = j.state || {};         // { stop, tp, highest, lowest, opened_at }\n\n  let stop = Number(state.stop);\n  if (atr > 0) {\n    if (side === 'LONG') {\n      const highest = Math.max(Number(state.highest || mark), mark);\n      const candidate = highest - atr * 2;\n      if (candidate > stop) stop = candidate;\n      state.highest = highest;\n    } else {\n      const lowest = Number(state.lowest) > 0 ? Math.min(Number(state.lowest), mark) : mark;\n      const candidate = lowest + atr * 2;\n      if (candidate > 0 && candidate < stop) stop = candidate;\n      state.lowest = lowest;\n    }\n  }\n\n  const heldH = state.opened_at ? (Date.now() - Date.parse(state.opened_at)) / 3600000 : 0;\n  let reason = 'HOLD';\n  if (side === 'LONG') {\n    if (mark <= stop) reason = 'STOP_LOSS';\n    else if (mark >= Number(state.tp)) reason = 'TAKE_PROFIT';\n  } else {\n    if (mark >= stop) reason = 'STOP_LOSS';\n    else if (mark <= Number(state.tp)) reason = 'TAKE_PROFIT';\n  }\n  if (reason === 'HOLD' && heldH >= Number(j.cfg.max_hold_hours)) reason = 'TIME_STOP';\n\n  // anomali = flatten\n  const anomalies = [];\n  if (Number(pos.leverage) !== Number(j.cfg.leverage)) anomalies.push(`LEVERAGE_${pos.leverage}`);\n  if (!String(pos.isolatedMode || '').startsWith('ISOLATED')) anomalies.push('NOT_ISOLATED');\n  if (j.whitelist && !j.whitelist.includes(pos.symbol)) anomalies.push('SYMBOL_NOT_WHITELISTED');\n  if (anomalies.length) reason = 'ANOMALY:' + anomalies.join(',');\n\n  out.push({ json: { ...j, side, mark, stop, reason, exit: reason !== 'HOLD', state } });\n}\nreturn out;\n"
+      },
+      "id": "e640f04a-70e7-9985-a511-13c1b750ebf7",
+      "name": "Hitung trailing & exit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -350,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.exit }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "876ce0c8-1908-ffe7-4927-2b6ca6ed62c2",
+      "name": "Perlu exit?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        400,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// n8n/code/risk_guard.js\n// Port JavaScript dari risk_engine/risk_engine.py untuk dijalankan di n8n Code node.\n//\n// PENTING: risk_engine.py adalah SPESIFIKASI. Berkas ini adalah salinan untuk runtime\n// n8n. Keduanya harus tetap sinkron -- bila salah satu diubah, ubah keduanya dan\n// jalankan `python -m pytest -q` serta bandingkan keluaran pada sinyal uji yang sama.\n//\n// Mode n8n Code node: \"Run Once for All Items\"\n// Input  : items = [{ json: { signal, equity, entry, rules, cfg, openPositions, breaker, now } }]\n// Output : [{ json: { ...decision, clientOrderId?, orderBody? } }]\n\nconst DEFAULT_TAKER_FEE = 0.0005;\nconst DEFAULT_MMR = 0.005;\n\n// ---------------------------------------------------------------- likuidasi\n\nfunction liquidationRoom(leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE) {\n  return 1 / leverage - mmr - fee;\n}\n\n// Jarak dari ENTRY ke harga likuidasi (fraksi). Identik dengan Python.\nfunction liquidationDistance(leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE, side = 'LONG') {\n  if (leverage <= 0) throw new Error('leverage harus > 0');\n  const s = String(side).toUpperCase();\n  if (s !== 'LONG' && s !== 'SHORT') throw new Error('side harus LONG atau SHORT');\n  const room = liquidationRoom(leverage, mmr, fee);\n  if (room <= 0) throw new Error(`leverage ${leverage}x tidak menyisakan ruang likuidasi`);\n  return s === 'SHORT' ? (room + fee) / (1 - fee) : (room + fee) / (1 + fee);\n}\n\nfunction liquidationPrice(side, entry, leverage, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE) {\n  const s = String(side).toUpperCase();\n  const imr = 1 / leverage;\n  if (s === 'LONG') return (entry * (1 - imr + mmr + fee)) / (1 + fee);\n  if (s === 'SHORT') return (entry * (1 + imr - mmr - fee)) / (1 - fee);\n  throw new Error('side harus LONG atau SHORT');\n}\n\n// Guard: tolak entry bila estimator lokal tidak cocok dengan angka bursa.\nfunction checkLiqAgainstExchange(side, entry, localLiq, exchangeLiq, tolerance = 0.002) {\n  if (!exchangeLiq || exchangeLiq <= 0) return [false, 'EXCHANGE_LIQ_MISSING'];\n  const drift = Math.abs(localLiq - exchangeLiq) / entry;\n  if (drift > tolerance) return [false, `LIQ_MISMATCH drift=${drift.toFixed(5)} tol=${tolerance}`];\n  const s = String(side).toUpperCase();\n  if (s === 'LONG' && localLiq < exchangeLiq * (1 - tolerance)) return [false, 'LOCAL_LIQ_TOO_OPTIMISTIC_LONG'];\n  if (s === 'SHORT' && localLiq > exchangeLiq * (1 + tolerance)) return [false, 'LOCAL_LIQ_TOO_OPTIMISTIC_SHORT'];\n  return [true, 'OK'];\n}\n\nfunction maxUsableRr(leverage, stopDistance, mmr = DEFAULT_MMR, fee = DEFAULT_TAKER_FEE,\n                     liqBufferPct = 33, targetFrac = 0.9) {\n  const d = liquidationDistance(leverage, mmr, fee);\n  const maxStop = d * (1 - liqBufferPct / 100);\n  if (stopDistance <= 0 || stopDistance > maxStop) return 0;\n  return (d * targetFrac) / stopDistance;\n}\n\n// ---------------------------------------------------------------- presisi\n\nfunction roundStep(value, step, mode = 'down') {\n  if (!(step > 0)) return value;\n  const n = mode === 'down' ? Math.floor(value / step + 1e-12) : Math.ceil(value / step - 1e-12);\n  return Math.round(n * step * 1e12) / 1e12;\n}\n\nfunction breakevenMove(fee = DEFAULT_TAKER_FEE) {\n  return fee * 2;\n}\n\n// ---------------------------------------------------------------- EV\n\nfunction expectedValue(winRate, avgWin, avgLoss, cost) {\n  return winRate * avgWin - (1 - winRate) * avgLoss - cost;\n}\n\nfunction minWinRateForProfit(rr, fee = DEFAULT_TAKER_FEE) {\n  const cost = breakevenMove(fee) * 100; // persen, agar satuannya sama dengan avg_win/avg_loss\n  return (1 + cost) / (1 + rr);\n}\n\n// ---------------------------------------------------------------- sizing\n\nfunction sizePosition(equity, entry, stopDistance, rules, cfg) {\n  if (!(equity > 0) || !(entry > 0)) return { qty: 0, reason: 'EQUITY_OR_ENTRY_INVALID' };\n  if (!(stopDistance > 0)) return { qty: 0, reason: 'STOP_DISTANCE_INVALID' };\n\n  const effStop = stopDistance + cfg.slippage_buffer_pct / 100;\n  const riskAmount = (equity * cfg.risk_per_trade_pct) / 100;\n\n  const qtyRisk = riskAmount / (entry * effStop);\n  const qtyLev = (equity * cfg.max_effective_leverage) / entry;\n  const qtyMargin = ((equity * cfg.max_margin_per_trade_pct) / 100) * cfg.leverage / entry;\n\n  const candidates = [\n    ['RISK_BUDGET', qtyRisk],\n    ['EFFECTIVE_LEVERAGE', qtyLev],\n    ['MARGIN_CAP', qtyMargin],\n  ];\n  let qty = Math.min(qtyRisk, qtyLev, qtyMargin);\n  let binding = candidates.reduce((a, b) => (b[1] < a[1] ? b : a))[0];\n\n  const ceiling = (equity * cfg.max_effective_leverage) / entry;\n  if (qty >= ceiling) {\n    qty = ceiling;\n    binding = 'EFFECTIVE_LEVERAGE_CEILING';\n  }\n\n  qty = roundStep(qty, rules.base_step, 'down');\n  qty = Math.min(qty, rules.max_size);\n  const notional = qty * entry;\n  return {\n    qty,\n    notional,\n    margin: notional / cfg.leverage,\n    risk_amount: qty * entry * effStop,\n    binding_constraint: binding,\n  };\n}\n\n// ---------------------------------------------------------------- gerbang utama\n\nfunction ageSec(iso, now) {\n  if (!iso) return Infinity;\n  const t = Date.parse(String(iso).replace('Z', '+00:00'));\n  if (Number.isNaN(t)) return Infinity;\n  return Math.max(0, (now - t) / 1000);\n}\n\n// DEFAULT DENY. Mengembalikan { approved, reasons, ... }.\nfunction validateSignal(signal, equity, entry, rules, cfg, opts = {}) {\n  const now = opts.now || Date.now();\n  const reasons = [];\n  const warnings = [];\n  const stats = signal.stats || {};\n\n  const direction = String(signal.direction || 'NONE').toUpperCase();\n  if (direction !== 'LONG' && direction !== 'SHORT') reasons.push('DIRECTION_NONE');\n\n  // --- Gerbang 1: MiroFish -------------------------------------------------\n  const miro = signal.mirofish || {};\n  if (!miro.schema_ok) reasons.push('MIROFISH_SCHEMA_INVALID');\n  const verdictAge = ageSec(miro.verdict_ts, now);\n  if (verdictAge > cfg.max_verdict_age_sec) reasons.push(`MIROFISH_STALE age=${verdictAge.toFixed(0)}s`);\n  const conf = Number(miro.confidence || 0);\n  if (conf < cfg.min_confidence) reasons.push(`MIROFISH_LOW_CONFIDENCE ${conf.toFixed(2)}<${cfg.min_confidence}`);\n  const eventRisk = String(miro.event_risk || 'UNKNOWN').toUpperCase();\n  if (cfg.veto_if_high_event_risk && eventRisk === 'HIGH') reasons.push('MIROFISH_HIGH_EVENT_RISK_VETO');\n  const bias = String(miro.bias || 'NEUTRAL').toUpperCase();\n  if (bias !== 'NEUTRAL' && bias !== direction && (direction === 'LONG' || direction === 'SHORT')) {\n    reasons.push(`MIROFISH_BIAS_CONFLICT ${bias} vs ${direction}`);\n  }\n\n  // --- Gerbang 2: struktur trade ------------------------------------------\n  const stop = Number(signal.stop);\n  const tp = Number(signal.take_profit);\n  let stopDistance = NaN;\n  let rr = 0;\n  let reward = NaN;\n  if (!Number.isFinite(stop) || !Number.isFinite(tp) || stop <= 0 || tp <= 0) {\n    reasons.push('MISSING_STOP_OR_TP');\n  } else {\n    if (direction === 'LONG') {\n      stopDistance = (entry - stop) / entry;\n      reward = (tp - entry) / entry;\n    } else {\n      stopDistance = (stop - entry) / entry;\n      reward = (entry - tp) / entry;\n    }\n    if (stopDistance <= 0) reasons.push('STOP_ON_WRONG_SIDE');\n    if (reward <= 0) reasons.push('TP_ON_WRONG_SIDE');\n    rr = stopDistance > 0 ? reward / stopDistance : 0;\n    if (rr < cfg.min_rr_ratio) reasons.push(`RR_TOO_LOW ${rr.toFixed(2)}<${cfg.min_rr_ratio}`);\n  }\n\n  const sigAge = ageSec(signal.ts, now);\n  if (sigAge > cfg.max_signal_age_sec) reasons.push(`SIGNAL_STALE age=${sigAge.toFixed(0)}s`);\n\n  // --- Gerbang 3: likuidasi ------------------------------------------------\n  let liqDist = NaN;\n  try {\n    liqDist = liquidationDistance(cfg.leverage, rules.mmr, rules.taker_fee, direction);\n  } catch (e) {\n    reasons.push(`LEVERAGE_CONFIG_INVALID ${e.message}`);\n  }\n  if (Number.isFinite(liqDist) && Number.isFinite(stopDistance)) {\n    const maxAllowed = liqDist * (1 - cfg.liq_buffer_pct / 100);\n    if (stopDistance >= maxAllowed) {\n      reasons.push(`STOP_TOO_FAR ${(stopDistance * 100).toFixed(4)}%>=${(maxAllowed * 100).toFixed(4)}%`);\n    }\n  }\n\n  // --- Gerbang 4: statistik & EV -------------------------------------------\n  const winRate = Number(stats.win_rate || 0);\n  const avgWin = Number(stats.avg_win_pct || 0);\n  const avgLoss = Number(stats.avg_loss_pct || 1);\n  const cost = breakevenMove(rules.taker_fee);\n  const ev = expectedValue(winRate, avgWin, avgLoss, cost);\n  if (winRate <= 0) reasons.push('NO_TRACK_RECORD');\n  else if (cfg.veto_on_negative_ev && ev <= 0) reasons.push(`NEGATIVE_EV ${ev.toFixed(5)}`);\n  if (Number.isFinite(stopDistance) && stopDistance > 0 && avgLoss > stopDistance * 1.05) {\n    reasons.push(`STATS_INCONSISTENT avg_loss=${avgLoss.toFixed(5)} > stop=${stopDistance.toFixed(5)}`);\n  }\n  if (avgWin > 0 && reward > 0 && avgWin > reward * 1.05) {\n    reasons.push(`STATS_INCONSISTENT avg_win=${avgWin.toFixed(5)} > reward=${reward.toFixed(5)}`);\n  }\n\n  // --- Gerbang 5: kapasitas & breaker --------------------------------------\n  const openPositions = Number(opts.openPositions || 0);\n  if (openPositions >= cfg.max_open_positions) {\n    reasons.push(`MAX_OPEN_POSITIONS ${openPositions}>=${cfg.max_open_positions}`);\n  }\n  if (opts.breaker && opts.breaker.tripped) {\n    reasons.push(`CIRCUIT_BREAKER_TRIPPED ${opts.breaker.reason || ''}`);\n  }\n\n  // --- Sizing --------------------------------------------------------------\n  let sizing = {};\n  if (Number.isFinite(stopDistance) && stopDistance > 0) {\n    sizing = sizePosition(equity, entry, stopDistance, rules, cfg);\n  }\n  const qty = Number(sizing.qty || 0);\n  const notional = Number(sizing.notional || 0);\n  if (qty <= 0) reasons.push('SIZE_ZERO');\n  else {\n    if (qty < rules.min_size) reasons.push(`BELOW_MIN_SIZE ${qty}<${rules.min_size}`);\n    if (notional < rules.min_notional) reasons.push(`BELOW_MIN_NOTIONAL ${notional}<${rules.min_notional}`);\n    if (notional > equity * cfg.max_effective_leverage) reasons.push('EFFECTIVE_LEVERAGE_BREACH');\n  }\n\n  // --- Peringatan ----------------------------------------------------------\n  if (Number.isFinite(liqDist) && liqDist < 0.02) {\n    warnings.push(`LIQ_DISTANCE_TINY ${(liqDist * 100).toFixed(3)}% -- ruang stop sempit`);\n  }\n  if (conf < 0.75) warnings.push('MIROFISH_CONFIDENCE_MARGINAL');\n  if (rules.taker_fee > 0.0005) warnings.push('HIGH_TAKER_FEE');\n\n  const approved = reasons.length === 0;\n  return {\n    approved,\n    reasons,\n    warnings,\n    size: approved ? qty : 0,\n    notional: approved ? notional : 0,\n    margin: approved ? Number(sizing.margin || 0) : 0,\n    stop_distance_pct: Number.isFinite(stopDistance) ? stopDistance : 0,\n    liq_distance_pct: Number.isFinite(liqDist) ? liqDist : 0,\n    risk_amount: approved ? Number(sizing.risk_amount || 0) : 0,\n    rr_ratio: rr,\n    ev_per_trade_pct: ev,\n    effective_leverage: approved && equity > 0 ? notional / equity : 0,\n    binding_constraint: sizing.binding_constraint || '',\n  };\n}\n\n// ---------------------------------------------------------------- idempotensi & signing\n\nfunction buildClientOrderId(signalId, symbol, action) {\n  const crypto = require('crypto');\n  const digest = crypto.createHash('sha256').update(`${signalId}|${symbol}|${action}`).digest('hex').slice(0, 24);\n  const act = String(action).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8) || 'ACT';\n  return `pg-${act}-${digest}`.slice(0, 64);\n}\n\nfunction signPionex(method, path, query, body, secret) {\n  const crypto = require('crypto');\n  const joined = Object.keys(query).sort().map((k) => `${k}=${query[k]}`).join('&');\n  const pathUrl = joined ? `${path}?${joined}` : path;\n  let payload = `${method.toUpperCase()}${pathUrl}`;\n  if (method.toUpperCase() === 'POST' || method.toUpperCase() === 'DELETE') payload += body || '';\n  return crypto.createHmac('sha256', secret).update(payload, 'utf8').digest('hex');\n}\n\n// ---------------------------------------------------------------- entry point n8n\n\n\n// Di n8n Code node, tempelkan fungsi-fungsi di atas lalu akhiri dengan blok berikut\n// (module.exports diabaikan oleh n8n, tetapi membuat berkas ini bisa di-require saat uji):\n/*\n  const out = [];\n  for (const item of items) {\n    const { signal, equity, entry, rules, cfg, openPositions, breaker } = item.json;\n    const decision = validateSignal(signal, equity, entry, rules, cfg,\n                                    { openPositions, breaker, now: Date.now() });\n    out.push({ json: { ...decision, signal_id: signal.id || null } });\n  }\n  return out;\n*/\n\nconst out = [];\nfor (const item of items) {\n  const j = item.json;\n  const side = j.side === 'LONG' ? 'SELL' : 'BUY';\n  const clientOrderId = buildClientOrderId(j.position.positionId || j.position.symbol,\n                                           j.position.symbol, 'EXIT');\n  const body = JSON.stringify({\n    clientOrderId, symbol: j.position.symbol, positionSide: 'BOTH', side,\n    type: 'MARKET_QTY', size: String(Math.abs(Number(j.position.netSize))), reduceOnly: true,\n  });\n  const timestamp = Date.now();\n  out.push({ json: { ...j, clientOrderId, body, timestamp,\n                     signature: signPionex('POST', '/uapi/v1/trade/order', { timestamp }, body,\n                                           $env.PIONEX_API_SECRET) } });\n}\nreturn out;\n"
+      },
+      "id": "9c1cf989-244c-ee55-87c8-81f93e7a485f",
+      "name": "Bangun order exit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.pionex.com/uapi/v1/trade/order?timestamp={ $json.timestamp }",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "PIONEX-KEY",
+              "value": "={{ $env.PIONEX_API_KEY }}"
+            },
+            {
+              "name": "PIONEX-SIGNATURE",
+              "value": "={{ $json.signature }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        },
+        "onError": "continueRegularOutput",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.body }}"
+      },
+      "id": "064b451b-54e9-71a8-a594-347cac01d754",
+      "name": "Kirim exit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        650,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE open_position SET closed_at = now(), close_reason = '{{ $json.reason }}' WHERE position_id = '{{ $json.position.positionId }}';",
+        "options": {}
+      },
+      "id": "6ec6117b-f082-c596-461e-9eac91dddedc",
+      "name": "Tutup posisi",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        900,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE open_position SET stop_price = {{ $json.stop }}, state = '{{ JSON.stringify($json.state) }}'::jsonb WHERE position_id = '{{ $json.position.positionId }}';",
+        "options": {}
+      },
+      "id": "a51be230-c229-5f55-b1b5-fb0286f1cf49",
+      "name": "Simpan stop terbaru",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        400,
+        -140
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Pionex Guard - Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Setiap 15 detik": {
+      "main": [
+        [
+          {
+            "node": "Ambil posisi",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Baca state posisi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ambil posisi": {
+      "main": [
+        [
+          {
+            "node": "Hitung trailing & exit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Baca state posisi": {
+      "main": [
+        [
+          {
+            "node": "Hitung trailing & exit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hitung trailing & exit": {
+      "main": [
+        [
+          {
+            "node": "Perlu exit?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Perlu exit?": {
+      "main": [
+        [
+          {
+            "node": "Bangun order exit",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simpan stop terbaru",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bangun order exit": {
+      "main": [
+        [
+          {
+            "node": "Kirim exit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kirim exit": {
+      "main": [
+        [
+          {
+            "node": "Tutup posisi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveExecutionProgress": true
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "pionex-guard-50x"
+    }
+  ]
+}
